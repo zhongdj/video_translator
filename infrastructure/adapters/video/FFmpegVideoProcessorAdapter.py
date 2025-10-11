@@ -5,6 +5,8 @@ import torch
 import torchaudio
 
 from domain.entities import *
+from infrastructure.adapters.subtitle.PySRTSubtitleWriterAdapter import PySRTSubtitleWriterAdapter
+
 
 class FFmpegVideoProcessorAdapter:
     """FFmpeg 视频处理适配器"""
@@ -162,6 +164,6 @@ class FFmpegVideoProcessorAdapter:
         ], check=True, capture_output=True, cwd=temp_srt_path.parent)
 
         # 清理
-        temp_srt_path.unlink()
+        #temp_srt_path.unlink()
 
         return output_path

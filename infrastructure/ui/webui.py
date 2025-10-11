@@ -95,6 +95,7 @@ def process_single_video_ui(
             subtitle_result.original_subtitle
         )
 
+        # 在调用 synthesize_video_use_case 后添加调试信息
         synthesis_result = synthesize_video_use_case(
             video=video,
             subtitles=(
@@ -111,11 +112,40 @@ def process_single_video_ui(
             progress=lambda p, d: prog_callback(0.8 + p * 0.2, d)
         )
 
+        # 调试：打印所有输出路径
+        print(f"🔍 所有输出文件:")
+        for path in synthesis_result.output_paths:
+            print(f"   - {path.name} (后缀: {path.suffix})")
+
+        # 查找中文字幕文件
+        zh_srt_files = [p for p in synthesis_result.output_paths if p.suffix == '.srt' and '.zh.' in p.name]
+        print(f"🔍 找到的中文字幕文件: {[f.name for f in zh_srt_files]}")
+
+        if zh_srt_files:
+            zh_srt = str(zh_srt_files[0])
+        else:
+            # 备用方案：查找任何中文字幕文件
+            all_srt_files = [p for p in synthesis_result.output_paths if p.suffix == '.srt']
+            print(f"🔍 所有SRT文件: {[f.name for f in all_srt_files]}")
+
+            # 如果还是没有，检查字幕对象的语言
+            print(f"🔍 字幕语言信息:")
+            for i, subtitle in enumerate(
+                    [subtitle_result.translated_subtitle, subtitle_result.original_subtitle, bilingual]):
+                if hasattr(subtitle, 'language'):
+                    print(f"   字幕{i}: {subtitle.language}")
+
+            # 最后尝试使用第一个SRT文件
+            if all_srt_files:
+                zh_srt = str(all_srt_files[0])
+                print(f"⚠️ 使用备用SRT文件: {zh_srt}")
+            else:
+                raise FileNotFoundError("未找到任何字幕文件")
+
         # 返回文件路径
         zh_srt = str([p for p in synthesis_result.output_paths if p.suffix == '.srt' and '.zh.' in p.name][0])
-        en_srt = str([p for p in synthesis_result.output_paths if p.suffix == '.srt' and '.en.' in p.name][0])
-        bilingual_ass = str(
-            [p for p in synthesis_result.output_paths if '_bilingual' in p.name and p.suffix == '.ass'][0])
+        en_srt = None #str([p for p in synthesis_result.output_paths if p.suffix == '.srt' and '.en.' in p.name][0])
+        bilingual_ass = None #str([p for p in synthesis_result.output_paths if '_bilingual' in p.name and p.suffix == '.ass'][0])
 
         # 找到视频文件
         video_files = [p for p in synthesis_result.output_paths if p.suffix == '.mp4']

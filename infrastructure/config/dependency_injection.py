@@ -4,6 +4,7 @@ from infrastructure.adapters.storage.FileCacheRepositoryAdapter import FileCache
 from infrastructure.adapters.subtitle.PySRTSubtitleWriterAdapter import PySRTSubtitleWriterAdapter
 from infrastructure.adapters.translation.QwenTranslateAdapter import QwenTranslationAdapter
 from infrastructure.adapters.tts.F5TTSAdapter import F5TTSAdapter
+from infrastructure.adapters.tts.indextts_adapter import IndexTTSAdapter
 from infrastructure.adapters.video.FFmpegVideoProcessorAdapter import FFmpegVideoProcessorAdapter
 
 
@@ -37,7 +38,7 @@ class DependencyContainer:
     def get_tts(self) -> F5TTSAdapter:
         """获取 TTS 提供者（懒加载）"""
         if self._tts is None:
-            self._tts = F5TTSAdapter()
+            self._tts = IndexTTSAdapter()
         return self._tts
 
     def cleanup(self):

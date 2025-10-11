@@ -1,22 +1,12 @@
 from application import *
-
-# 导入领域层
 from domain.entities import (
-    # Entities
     Video, Subtitle, TextSegment,
-    # Value Objects
-    TimeRange, LanguageCode, )
-
-from domain.ports import (
-# Ports
-    ASRProvider, TranslationProvider, VideoProcessor, CacheRepository,
-
+    TimeRange, LanguageCode,
 )
-
-from domain.services import (
-    # Domain Services
-    calculate_cache_key, )
-
+from domain.ports import (
+    ASRProvider, TranslationProvider, VideoProcessor, CacheRepository,
+)
+from domain.services import calculate_cache_key
 
 
 def generate_subtitles_use_case(
@@ -30,13 +20,13 @@ def generate_subtitles_use_case(
         progress: ProgressCallback = None
 ) -> SubtitleGenerationResult:
     """
-    生成字幕用例（纯函数）
+    生成字幕用例（修复版）- 支持多级翻译
 
     流程:
     1. 检查缓存
     2. 提取音频
     3. ASR 识别
-    4. 翻译
+    4. 智能翻译（非中英文先翻译成英文，再翻译成中文）
     5. 返回结果
     """
     if progress:
@@ -96,15 +86,57 @@ def generate_subtitles_use_case(
         source_language
     )
 
-    # 4. 翻译
+    # 4. 智能翻译流程
     if progress:
         progress(0.6, "翻译中")
 
-    translated_segments = translation_provider.translate(
-        original_segments,
-        detected_language,
-        target_language
-    )
+    def needs_two_step_translation(source_lang: LanguageCode, target_lang: LanguageCode) -> bool:
+        """判断是否需要两步翻译"""
+        # 如果源语言和目标语言都是中英文之一，直接翻译
+        common_langs = {LanguageCode.ENGLISH, LanguageCode.CHINESE}
+        if source_lang in common_langs and target_lang in common_langs:
+            return False
+        # 如果源语言不是中英文，目标语言是中文，需要两步翻译
+        if source_lang not in common_langs and target_lang == LanguageCode.CHINESE:
+            return True
+        # 如果源语言不是中英文，目标语言是英文，直接翻译
+        if source_lang not in common_langs and target_lang == LanguageCode.ENGLISH:
+            return False
+        # 其他情况直接翻译
+        return False
+
+    if needs_two_step_translation(detected_language, target_language):
+        print(f"🔀 检测到 {detected_language.value} -> 中文，启用两步翻译流程")
+
+        # 第一步：翻译成英文
+        if progress:
+            progress(0.7, f"翻译 {detected_language.value} -> 英文")
+
+        english_segments = translation_provider.translate(
+            original_segments,
+            detected_language,
+            LanguageCode.ENGLISH
+        )
+
+        # 第二步：从英文翻译成中文
+        if progress:
+            progress(0.8, "翻译 英文 -> 中文")
+
+        translated_segments = translation_provider.translate(
+            english_segments,
+            LanguageCode.ENGLISH,
+            target_language
+        )
+
+        print("✅ 两步翻译完成")
+    else:
+        # 直接翻译
+        print(f"🔀 直接翻译: {detected_language.value} -> {target_language.value}")
+        translated_segments = translation_provider.translate(
+            original_segments,
+            detected_language,
+            target_language
+        )
 
     # 5. 保存缓存
     cache_data = {

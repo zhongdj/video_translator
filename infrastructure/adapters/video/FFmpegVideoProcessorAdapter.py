@@ -1,4 +1,5 @@
 import subprocess
+from typing import Union
 
 import numpy as np
 import torch
@@ -137,12 +138,25 @@ class FFmpegVideoProcessorAdapter:
 
     def burn_subtitles(
             self,
-            video: Video,
+            video: Union[Video, Path],
             subtitle: Subtitle,
             output_path: Path
     ) -> Path:
-        """烧录字幕到视频"""
+        """
+        烧录字幕到视频
+
+        Args:
+            video: Video 对象或视频文件路径
+            subtitle: 字幕对象
+            output_path: 输出路径
+        """
         import tempfile
+
+        # 兼容 Video 对象和 Path
+        if isinstance(video, Video):
+            video_path = video.path
+        else:
+            video_path = video
 
         # 先写字幕文件
         temp_srt = tempfile.NamedTemporaryFile(mode='w', suffix=".ass", delete=False, encoding='utf-8')
@@ -155,7 +169,7 @@ class FFmpegVideoProcessorAdapter:
         # 烧录字幕
         subprocess.run([
             'ffmpeg', '-y',
-            '-i', str(video.path),
+            '-i', str(video_path),
             '-vf', f"ass={temp_srt_path.name}",
             '-c:v', 'libx264',
             '-crf', '23',
@@ -164,6 +178,6 @@ class FFmpegVideoProcessorAdapter:
         ], check=True, capture_output=True, cwd=temp_srt_path.parent)
 
         # 清理
-        #temp_srt_path.unlink()
+        # temp_srt_path.unlink()
 
         return output_path

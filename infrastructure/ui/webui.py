@@ -24,7 +24,6 @@ from infrastructure.config.dependency_injection import container
 
 
 # ============== UI 处理函数 ============== #
-
 def process_single_video_ui(
         video_file,
         whisper_model: str,
@@ -34,7 +33,17 @@ def process_single_video_ui(
         source_language: str,
         progress=gr.Progress()
 ):
-    """单视频处理 UI 处理函数"""
+    """
+    单视频处理 UI 处理函数 - 始终输出中英双语
+
+    输出规范:
+    - 中文字幕 (zh.srt)
+    - 英文字幕 (en.srt)
+    - 中英双语字幕 (zh_en.ass)
+    - 中文配音视频（无字幕）
+    - 中文配音+双语字幕视频
+    - 原始音频+中文硬字幕视频
+    """
     if not video_file:
         return None, None, None, None, None, "❌ 请上传视频"
 
@@ -59,7 +68,11 @@ def process_single_video_ui(
         def prog_callback(p: float, desc: str):
             progress(p, desc=desc)
 
-        # 1. 生成字幕
+        print(f"\n{'=' * 60}")
+        print(f"🎬 开始处理视频: {video.path.name}")
+        print(f"{'=' * 60}")
+
+        # ============== 1. 生成字幕（会同时生成中英文）============== #
         subtitle_result = generate_subtitles_use_case(
             video=video,
             asr_provider=container.get_asr(whisper_model),
@@ -71,14 +84,49 @@ def process_single_video_ui(
             progress=lambda p, d: prog_callback(p * 0.5, d)
         )
 
-        # 2. 语音克隆（如果启用）
+        detected_lang = subtitle_result.detected_language
+        zh_subtitle = subtitle_result.translated_subtitle  # 中文字幕
+
+        print(f"\n📝 字幕生成完成:")
+        print(f"   检测语言: {detected_lang.value}")
+        print(f"   中文字幕: {len(zh_subtitle.segments)} 片段")
+
+        # ============== 2. 从缓存获取英文字幕 ============== #
+        # 因为 generate_subtitles_use_case 已经生成了英文版本并缓存
+        from domain.services import calculate_cache_key
+        cache_key = calculate_cache_key(
+            video.path,
+            "subtitles",
+            {
+                "target_language": LanguageCode.CHINESE.value,
+                "source_language": src_lang.value if src_lang else "auto"
+            }
+        )
+
+        cached = container.cache_repo.get(cache_key)
+        en_segments = tuple(
+            TextSegment(
+                text=seg["text"],
+                time_range=TimeRange(seg["start"], seg["end"]),
+                language=LanguageCode.ENGLISH
+            )
+            for seg in cached.get("en_segments", [])
+        )
+        en_subtitle = Subtitle(en_segments, LanguageCode.ENGLISH)
+        print(f"   英文字幕: {len(en_subtitle.segments)} 片段")
+
+        # ============== 3. 语音克隆（使用中文字幕）============== #
         audio_track = None
         if enable_voice:
             ref_audio_path = Path(reference_audio_file.name) if reference_audio_file else None
 
+            print(f"\n🎤 开始语音克隆（中文配音）:")
+            if ref_audio_path:
+                print(f"   参考音频: {ref_audio_path.name}")
+
             voice_result = clone_voice_use_case(
                 video=video,
-                subtitle=subtitle_result.translated_subtitle,
+                subtitle=zh_subtitle,  # 使用中文字幕配音
                 tts_provider=container.get_tts(),
                 video_processor=container.video_processor,
                 cache_repo=container.cache_repo,
@@ -86,22 +134,23 @@ def process_single_video_ui(
                 progress=lambda p, d: prog_callback(0.5 + p * 0.3, d)
             )
             audio_track = voice_result.audio_track
+            print(f"✅ 中文配音完成")
 
-        # 3. 合成视频
-        # 创建双语字幕
+        # ============== 4. 合成视频 ============== #
+        # 创建中英双语字幕（中文在上，英文在下）
         from domain.services import merge_bilingual_subtitles
-        bilingual = merge_bilingual_subtitles(
-            subtitle_result.translated_subtitle,
-            subtitle_result.original_subtitle
+        zh_en_subtitle = merge_bilingual_subtitles(
+            zh_subtitle,  # 中文（上）
+            en_subtitle  # 英文（下）
         )
+        print(f"\n📝 中英双语字幕创建完成")
 
-        # 在调用 synthesize_video_use_case 后添加调试信息
         synthesis_result = synthesize_video_use_case(
             video=video,
             subtitles=(
-                subtitle_result.translated_subtitle,
-                subtitle_result.original_subtitle,
-                bilingual
+                zh_subtitle,  # zh.srt / zh.ass
+                en_subtitle,  # en.srt / en.ass
+                zh_en_subtitle  # zh_en.ass (双语)
             ),
             audio_track=audio_track,
             video_processor=container.video_processor,
@@ -112,55 +161,100 @@ def process_single_video_ui(
             progress=lambda p, d: prog_callback(0.8 + p * 0.2, d)
         )
 
-        # 调试：打印所有输出路径
-        print(f"🔍 所有输出文件:")
+        # ============== 5. 查找输出文件 ============== #
+        print(f"\n🔍 查找输出文件:")
         for path in synthesis_result.output_paths:
-            print(f"   - {path.name} (后缀: {path.suffix})")
+            print(f"   - {path.name}")
 
-        # 查找中文字幕文件
-        zh_srt_files = [p for p in synthesis_result.output_paths if p.suffix == '.srt' and '.zh.' in p.name]
-        print(f"🔍 找到的中文字幕文件: {[f.name for f in zh_srt_files]}")
+        # 智能查找文件
+        def find_file(patterns: list[str], suffix: str = None) -> Optional[str]:
+            for pattern in patterns:
+                matches = [
+                    p for p in synthesis_result.output_paths
+                    if pattern in p.name and (suffix is None or p.suffix == suffix)
+                ]
+                if matches:
+                    print(f"   ✅ {pattern}: {matches[0].name}")
+                    return str(matches[0])
+            print(f"   ⚠️  未找到匹配 {patterns}")
+            return None
 
-        if zh_srt_files:
-            zh_srt = str(zh_srt_files[0])
-        else:
-            # 备用方案：查找任何中文字幕文件
-            all_srt_files = [p for p in synthesis_result.output_paths if p.suffix == '.srt']
-            print(f"🔍 所有SRT文件: {[f.name for f in all_srt_files]}")
+        # 查找各类文件
+        zh_srt = find_file(['zh.srt', 'translated.zh'], '.srt')
+        en_srt = find_file(['en.srt', 'translated.en'], '.srt')
+        zh_en_ass = find_file(['zh_en', 'bilingual'], '.ass')
 
-            # 如果还是没有，检查字幕对象的语言
-            print(f"🔍 字幕语言信息:")
-            for i, subtitle in enumerate(
-                    [subtitle_result.translated_subtitle, subtitle_result.original_subtitle, bilingual]):
-                if hasattr(subtitle, 'language'):
-                    print(f"   字幕{i}: {subtitle.language}")
+        # 配音视频（纯配音，无字幕）
+        voiced_video = find_file(['_voiced.mp4']) if audio_track else None
 
-            # 最后尝试使用第一个SRT文件
-            if all_srt_files:
-                zh_srt = str(all_srt_files[0])
-                print(f"⚠️ 使用备用SRT文件: {zh_srt}")
-            else:
-                raise FileNotFoundError("未找到任何字幕文件")
+        # 配音+双语字幕视频
+        voiced_subtitled_video = find_file(['_voiced_subtitled.mp4']) if audio_track else None
 
-        # 返回文件路径
-        zh_srt = str([p for p in synthesis_result.output_paths if p.suffix == '.srt' and '.zh.' in p.name][0])
-        en_srt = None #str([p for p in synthesis_result.output_paths if p.suffix == '.srt' and '.en.' in p.name][0])
-        bilingual_ass = None #str([p for p in synthesis_result.output_paths if '_bilingual' in p.name and p.suffix == '.ass'][0])
+        # 原始视频+中文硬字幕
+        subtitled_video = find_file(['_subtitled.mp4'])
 
-        # 找到视频文件
-        video_files = [p for p in synthesis_result.output_paths if p.suffix == '.mp4']
-        voiced_video = str(video_files[0]) if video_files else None
-        subtitled_video = str(video_files[1]) if len(video_files) > 1 else None
+        # ============== 6. 生成状态报告 ============== #
+        status_lines = [
+            f"✅ 处理完成！耗时 {synthesis_result.processing_time:.1f} 秒",
+            f"",
+            f"📊 字幕信息:",
+            f"   检测语言: {detected_lang.value}",
+            f"   中文字幕: {len(zh_subtitle.segments)} 片段",
+            f"   英文字幕: {len(en_subtitle.segments)} 片段",
+            f"",
+            f"📦 生成文件: {len(synthesis_result.output_paths)} 个"
+        ]
 
-        status = f"✅ 处理完成！耗时 {synthesis_result.processing_time:.1f} 秒"
         if subtitle_result.cache_hit:
-            status += " (字幕缓存命中)"
+            status_lines.append("💾 字幕缓存命中")
 
-        return zh_srt, en_srt, bilingual_ass, voiced_video, subtitled_video, status
+        # 文件检查
+        file_status = []
+        if zh_srt:
+            file_status.append(f"✅ 中文字幕")
+        else:
+            file_status.append(f"❌ 中文字幕缺失")
+
+        if en_srt:
+            file_status.append(f"✅ 英文字幕")
+        else:
+            file_status.append(f"❌ 英文字幕缺失")
+
+        if zh_en_ass:
+            file_status.append(f"✅ 中英双语字幕")
+        else:
+            file_status.append(f"❌ 中英双语字幕缺失")
+
+        if voiced_video:
+            file_status.append(f"✅ 中文配音视频（无字幕）")
+        elif enable_voice:
+            file_status.append(f"❌ 中文配音视频缺失")
+
+        if voiced_subtitled_video:
+            file_status.append(f"✅ 中文配音+双语字幕视频")
+        elif enable_voice:
+            file_status.append(f"❌ 配音字幕视频缺失")
+
+        if subtitled_video:
+            file_status.append(f"✅ 原始音频+中文硬字幕")
+        else:
+            file_status.append(f"❌ 硬字幕视频缺失")
+
+        if file_status:
+            status_lines.append("")
+            status_lines.append("📁 文件状态:")
+            status_lines.extend([f"   {s}" for s in file_status])
+
+        status = "\n".join(status_lines)
+        print(f"\n{status}")
+        print(f"{'=' * 60}\n")
+
+        return zh_srt, en_srt, zh_en_ass, voiced_video, subtitled_video, status
 
     except Exception as e:
         import traceback
         error_msg = f"❌ 处理失败: {str(e)}\n\n{traceback.format_exc()}"
+        print(error_msg)
         return None, None, None, None, None, error_msg
 
 
@@ -470,6 +564,8 @@ def build_ui():
         - 🎤 F5-TTS 语音克隆（IndexTTS 2.0）
         """)
 
+        # 在 build_ui() 函数中，更新单视频处理的输出部分
+
         with gr.Tab("🎬 单视频处理"):
             gr.Markdown("""
             ### 处理流程
@@ -477,6 +573,11 @@ def build_ui():
             2. 选择模型配置
             3. （可选）上传参考音频进行语音克隆
             4. 开始处理
+
+            ### 输出说明
+            - 始终生成**中文**和**英文**字幕
+            - 如果启用语音克隆，生成**中文配音视频**
+            - 配音视频会自动烧录**中英双语字幕** ⭐
             """)
 
             with gr.Row():
@@ -507,7 +608,7 @@ def build_ui():
                         )
 
                     enable_voice_checkbox = gr.Checkbox(
-                        label="🎤 启用语音克隆（F5-TTS）",
+                        label="🎤 启用语音克隆（生成中文配音）",
                         value=False
                     )
 
@@ -527,17 +628,27 @@ def build_ui():
                     process_btn = gr.Button("▶️ 开始处理", variant="primary", size="lg")
 
                 with gr.Column():
-                    status_output = gr.Textbox(label="📊 处理状态", lines=3)
+                    status_output = gr.Textbox(label="📊 处理状态", lines=8)
 
+                    gr.Markdown("### 📝 字幕文件")
                     with gr.Row():
-                        zh_srt_output = gr.File(label="📝 中文字幕")
-                        en_srt_output = gr.File(label="📝 英文字幕")
+                        zh_srt_output = gr.File(label="中文字幕 (SRT)")
+                        en_srt_output = gr.File(label="英文字幕 (SRT)")
 
-                    with gr.Row():
-                        bilingual_output = gr.File(label="📝 双语字幕")
-                        voiced_output = gr.File(label="🎤 中文配音视频")
+                    zh_en_ass_output = gr.File(label="中英双语字幕 (ASS)")
 
-                    subtitled_output = gr.File(label="🎬 硬字幕视频")
+                    gr.Markdown("### 🎬 视频文件")
+
+                    with gr.Accordion("💡 查看文件说明", open=False):
+                        gr.Markdown("""
+                        - **配音视频（无字幕）**: 仅含中文配音，无烧录字幕
+                        - **配音+双语字幕视频** ⭐: 中文配音 + 中英双语硬字幕（推荐观看）
+                        - **原音+中文字幕视频**: 保留原始音频 + 中文硬字幕
+                        """)
+
+                    voiced_output = gr.File(label="中文配音视频（无字幕）")
+                    voiced_subtitled_output = gr.File(label="⭐ 中文配音+双语字幕视频（推荐）")
+                    subtitled_output = gr.File(label="原音+中文硬字幕视频")
 
             process_btn.click(
                 process_single_video_ui,
@@ -550,12 +661,13 @@ def build_ui():
                     source_lang_input
                 ],
                 outputs=[
-                    zh_srt_output,
-                    en_srt_output,
-                    bilingual_output,
-                    voiced_output,
-                    subtitled_output,
-                    status_output
+                    zh_srt_output,  # 中文字幕
+                    en_srt_output,  # 英文字幕
+                    zh_en_ass_output,  # 双语字幕
+                    voiced_output,  # 配音视频（无字幕）
+                    voiced_subtitled_output,  # 配音+双语字幕（推荐）
+                    #subtitled_output,  # 原音+中文字幕
+                    status_output  # 状态信息
                 ]
             )
 

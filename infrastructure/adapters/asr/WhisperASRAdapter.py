@@ -77,9 +77,9 @@ class WhisperASRAdapter:
         detected_language = LanguageCode(result["language"])
 
         # 模仿原项目的清理逻辑
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # del model
+        # if torch.cuda.is_available():
+        #     torch.cuda.empty_cache()
 
         return segments, detected_language
 

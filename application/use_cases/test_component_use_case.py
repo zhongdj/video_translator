@@ -45,7 +45,7 @@ def test_component_use_case(
             progress(0.3, "ASR 识别中")
 
         segments, detected_lang = asr_provider.transcribe(audio_path, language)
-
+        asr_provider.unload()
         if progress:
             progress(1.0, "ASR 测试完成")
 

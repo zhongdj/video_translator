@@ -97,7 +97,7 @@ def generate_subtitles_use_case(
         audio_path,
         source_language
     )
-
+    asr_provider.unload()
     print(f"\n🎤 ASR 识别完成:")
     print(f"   检测语言: {detected_language.value}")
     print(f"   片段数量: {len(original_segments)}")

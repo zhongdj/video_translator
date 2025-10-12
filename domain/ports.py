@@ -18,6 +18,11 @@ class ASRProvider(Protocol):
         """
         ...
 
+    def unload(self):
+        """
+        释放内存
+        :return:
+        """
 
 class TranslationProvider(Protocol):
     """翻译提供者接口"""

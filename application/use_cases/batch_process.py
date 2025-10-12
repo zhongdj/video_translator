@@ -29,7 +29,6 @@ from domain.services import (
     calculate_cache_key,
 )
 
-
 # ============== 中间数据结构 ============== #
 
 @dataclass(frozen=True)
@@ -118,8 +117,7 @@ def stage1_batch_asr(
                 for seg in cached.get("zh_segments", [])
             )
 
-            original_subtitle = Subtitle(original_segments, detected_lang) if original_segments else Subtitle(
-                zh_segments, detected_lang)
+            original_subtitle = Subtitle(original_segments, detected_lang) if original_segments else Subtitle(zh_segments, detected_lang)
             translated_subtitle = Subtitle(zh_segments, LanguageCode.CHINESE)
 
             print(f"  💾 缓存命中: {video.path.name}")
@@ -197,6 +195,7 @@ def stage1_batch_asr(
         )
         results.append(result)
 
+    asr_provider.unload()
     if progress:
         progress(1.0, f"阶段1完成: 处理了 {total} 个视频")
 
@@ -262,16 +261,28 @@ def stage2_batch_tts(
             # 从缓存加载
             cached = cache_repo.get(cache_key)
 
-            from domain.entities import AudioSample, VoiceProfile
+            # 验证缓存数据完整性
+            if cached is None or "audio_samples" not in cached or "sample_rate" not in cached:
+                print(f"  ⚠️  缓存数据损坏，重新生成: {vs.video.path.name}")
+                cache_hit = False
+            else:
+                from domain.entities import AudioSample, VoiceProfile
 
-            audio_sample = AudioSample(
-                samples=tuple(cached["audio_samples"]),
-                sample_rate=cached["sample_rate"]
-            )
+                try:
+                    audio_sample = AudioSample(
+                        samples=tuple(cached["audio_samples"]),
+                        sample_rate=cached["sample_rate"]
+                    )
 
-            audio_track = AudioTrack(audio_sample, vs.translated_subtitle.language)
+                    audio_track = AudioTrack(audio_sample, vs.translated_subtitle.language)
 
-            print(f"  💾 缓存命中: {vs.video.path.name}")
+                    print(f"  💾 缓存命中: {vs.video.path.name}")
+                except (KeyError, TypeError) as e:
+                    print(f"  ⚠️  缓存数据解析失败: {e}，重新生成")
+                    cache_hit = False
+
+        # if not cache_hit:
+
         else:
             # 提取参考音频
             reference_audio_path = video_processor.extract_reference_audio(
@@ -460,11 +471,11 @@ def batch_process_use_case(
     if progress:
         progress(0.0, f"开始优化批量处理 {len(videos)} 个视频")
 
-    print(f"\n{'=' * 60}")
+    print(f"\n{'='*60}")
     print(f"🚀 优化批量处理模式")
     print(f"   视频数量: {len(videos)}")
     print(f"   语音克隆: {'启用' if enable_voice_cloning else '禁用'}")
-    print(f"{'=' * 60}\n")
+    print(f"{'='*60}\n")
 
     # 阶段1: 批量 ASR + 翻译
     print(f"📝 阶段1: 批量语音识别和翻译")
@@ -509,13 +520,13 @@ def batch_process_use_case(
     cache_hits_subtitle = sum(1 for vs in video_subtitles if vs.cache_hit_subtitle)
     cache_hits_audio = sum(1 for va in video_audios if va.cache_hit_audio)
 
-    print(f"\n{'=' * 60}")
+    print(f"\n{'='*60}")
     print(f"✅ 批量处理完成")
     print(f"   总视频数: {len(videos)}")
     print(f"   字幕缓存命中: {cache_hits_subtitle}/{len(videos)}")
     if enable_voice_cloning:
         print(f"   音频缓存命中: {cache_hits_audio}/{len(videos)}")
     print(f"   输出文件数: {sum(len(r.output_paths) for r in results)}")
-    print(f"{'=' * 60}\n")
+    print(f"{'='*60}\n")
 
     return results

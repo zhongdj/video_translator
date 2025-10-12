@@ -11,6 +11,69 @@ from domain.ports import (
     VideoProcessor, SubtitleWriter, )
 
 
+def generate_subtitle_files_with_paths(
+        subtitles: tuple[Subtitle, ...],
+        video: Video,
+        subtitle_writer: SubtitleWriter,
+        output_dir: Path,
+        formats: tuple[str, ...] = ("srt", "ass")
+) -> tuple[Subtitle, ...]:
+    """
+    为字幕列表生成文件并返回带路径的 Subtitle 对象
+
+    Args:
+        subtitles: 原始字幕对象列表
+        video: 视频对象
+        subtitle_writer: 字幕写入器
+        output_dir: 输出目录
+        formats: 要生成的格式
+
+    Returns:
+        带有路径属性的新 Subtitle 对象列表
+    """
+
+    base_name = video.path.stem
+    subtitles_with_paths = []
+
+    for subtitle in subtitles:
+        lang_code = subtitle.language.value
+
+        # 检查是否是双语字幕（文本中包含换行符）
+        is_bilingual = any('\n' in seg.text for seg in subtitle.segments)
+
+        if is_bilingual:
+            # 双语字幕：命名为 zh_en
+            file_prefix = "zh_en"
+        else:
+            # 单语字幕：直接使用语言代码
+            file_prefix = lang_code
+
+        subtitle_path = None
+
+        # 生成指定格式的字幕文件
+        if "srt" in formats:
+            srt_path = output_dir / f"{base_name}.{file_prefix}.srt"
+            subtitle_writer.write_srt(subtitle, srt_path)
+            subtitle_path = srt_path  # 优先使用 srt 路径
+            print(f"📝 生成字幕: {srt_path.name}")
+
+        if "ass" in formats and subtitle_path is None:
+            # 如果没有生成 srt，则使用 ass 路径
+            ass_path = output_dir / f"{base_name}.{file_prefix}.ass"
+            subtitle_writer.write_ass(subtitle, ass_path)
+            subtitle_path = ass_path
+            print(f"📝 生成字幕: {ass_path.name}")
+
+        # 创建带有路径的新 Subtitle 对象
+        if subtitle_path:
+            new_subtitle = subtitle.with_path(subtitle_path)
+            subtitles_with_paths.append(new_subtitle)
+        else:
+            # 如果没有生成任何文件，保持原样
+            subtitles_with_paths.append(subtitle)
+
+    return tuple(subtitles_with_paths)
+
 def synthesize_video_use_case(
         video: Video,
         subtitles: tuple[Subtitle, ...],
@@ -46,30 +109,17 @@ def synthesize_video_use_case(
     # 新规范: 始终生成 zh, en, zh_en 三种字幕
     base_name = video.path.stem
 
-    for subtitle in subtitles:
-        lang_code = subtitle.language.value
+    # 为双语字幕也生成文件
+    bilingual_with_paths = generate_subtitle_files_with_paths(
+        subtitles=subtitles,
+        video=video,
+        subtitle_writer=subtitle_writer,
+        output_dir=output_dir,
+        formats=("srt", "ass")  # 双语字幕生成所有格式
+    )
 
-        # 检查是否是双语字幕（文本中包含换行符）
-        is_bilingual = any('\n' in seg.text for seg in subtitle.segments)
-
-        if is_bilingual:
-            # 双语字幕：命名为 zh_en
-            file_prefix = "zh_en"
-        else:
-            # 单语字幕：直接使用语言代码
-            file_prefix = lang_code
-
-        if "srt" in formats:
-            srt_path = output_dir / f"{base_name}.{file_prefix}.srt"
-            subtitle_writer.write_srt(subtitle, srt_path)
-            output_paths.append(srt_path)
-            print(f"📝 生成字幕: {srt_path.name}")
-
-        if "ass" in formats:
-            ass_path = output_dir / f"{base_name}.{file_prefix}.ass"
-            subtitle_writer.write_ass(subtitle, ass_path)
-            output_paths.append(ass_path)
-            print(f"📝 生成字幕: {ass_path.name}")
+    bilingual_with_path = bilingual_with_paths[2]
+    print(bilingual_with_path)
 
     # 2. 合并音视频（如果有配音）
     if audio_track is not None:
@@ -90,29 +140,18 @@ def synthesize_video_use_case(
             if progress:
                 progress(0.7, "为配音视频烧录双语字幕")
 
-            bilingual_subtitle = subtitles[2]  # 第三个是双语字幕
             voiced_subtitled = output_dir / f"{video.path.stem}_voiced_subtitled.mp4"
             video_processor.burn_subtitles(
-                voiced_output,  # 基于配音视频
-                bilingual_subtitle,
+                Video(path = voiced_output,
+                      duration=video.duration,
+                      has_audio=True),  # 基于配音视频
+                bilingual_with_path,
                 voiced_subtitled
             )
             output_paths.append(voiced_subtitled)
             print(f"🎬 生成配音+双语字幕视频: {voiced_subtitled.name}")
 
-    # 3. 烧录字幕到原始视频（仅中文字幕）
-    if burn_subtitles and subtitles:
-        if progress:
-            progress(0.8, "烧录字幕到原始视频")
 
-        burned_output = output_dir / f"{video.path.stem}_subtitled.mp4"
-        video_processor.burn_subtitles(
-            video,
-            subtitles[0],  # 使用中文字幕
-            burned_output
-        )
-        output_paths.append(burned_output)
-        print(f"🎬 生成硬字幕视频（中文）: {burned_output.name}")
 
     if progress:
         progress(1.0, "视频合成完成")

@@ -6,10 +6,10 @@ import torch
 import torchaudio
 
 from domain.entities import *
-from infrastructure.adapters.subtitle.PySRTSubtitleWriterAdapter import PySRTSubtitleWriterAdapter
+from domain.ports import VideoProcessor
 
 
-class FFmpegVideoProcessorAdapter:
+class FFmpegVideoProcessorAdapter(VideoProcessor):
     """FFmpeg 视频处理适配器"""
 
     def extract_audio(self, video: Video) -> Path:
@@ -138,46 +138,101 @@ class FFmpegVideoProcessorAdapter:
 
     def burn_subtitles(
             self,
-            video: Union[Video, Path],
+            video: Video,
             subtitle: Subtitle,
             output_path: Path
     ) -> Path:
-        """
-        烧录字幕到视频
-
-        Args:
-            video: Video 对象或视频文件路径
-            subtitle: 字幕对象
-            output_path: 输出路径
-        """
+        """烧录字幕到视频"""
         import tempfile
+        import shutil
+        from domain.ports import SubtitleWriter
 
-        # 兼容 Video 对象和 Path
-        if isinstance(video, Video):
-            video_path = video.path
-        else:
-            video_path = video
+        try:
+            # 创建输出目录
+            output_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # 先写字幕文件
-        temp_srt = tempfile.NamedTemporaryFile(mode='w', suffix=".ass", delete=False, encoding='utf-8')
-        temp_srt_path = Path(temp_srt.name)
+            # 使用临时目录工作，避免路径问题
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmpdir_path = Path(tmpdir)
 
-        # 使用 SubtitleWriter 写入
-        writer = PySRTSubtitleWriterAdapter()
-        writer.write_ass(subtitle, temp_srt_path)
+                # 复制视频文件到临时目录
+                temp_video = tmpdir_path / "video.mp4"
+                temp_subtitle = tmpdir_path / "subtitle.ass"
+                temp_output = tmpdir_path / "output.mp4"
 
-        # 烧录字幕
-        subprocess.run([
-            'ffmpeg', '-y',
-            '-i', str(video_path),
-            '-vf', f"ass={temp_srt_path.name}",
-            '-c:v', 'libx264',
-            '-crf', '23',
-            '-c:a', 'copy',
-            str(output_path)
-        ], check=True, capture_output=True, cwd=temp_srt_path.parent)
+                # 使用断言确保路径存在
+                assert subtitle.path is not None, "字幕文件路径不能为空"
 
-        # 清理
-        # temp_srt_path.unlink()
+                shutil.copy2(video.path, temp_video)
+                shutil.copy2(subtitle.path, temp_subtitle)
 
-        return output_path
+                # 使用相对路径
+                subtitle_filter = "subtitles=subtitle.ass"
+
+                # 尝试硬件编码
+                cmd_hardware = [
+                    'ffmpeg', '-y',
+                    '-i', 'video.mp4',
+                    '-vf', subtitle_filter,
+                    '-c:v', 'h264_nvenc',
+                    '-preset', 'p4',  # p1最快，p7最慢
+                    '-cq', '23',  # 恒定质量模式
+                    '-rc', 'vbr',  # 可变比特率
+                    '-c:a', 'copy',
+                    '-y', 'output.mp4'
+                ]
+
+                print(f"执行 FFmpeg 命令: {' '.join(cmd_hardware)} (在临时目录: {tmpdir})")
+
+                try:
+                    result = subprocess.run(
+                        cmd_hardware,
+                        cwd=tmpdir,
+                        capture_output=True,
+                        text=True,
+                        timeout=300
+                    )
+
+                    if result.returncode == 0:
+                        # 复制输出文件
+                        shutil.copy2(temp_output, output_path)
+                        print(f"✅ 硬件编码成功: {output_path}")
+                        return output_path
+                    else:
+                        print(f"硬件编码失败: {result.stderr}")
+                        raise RuntimeError("硬件编码失败")
+
+                except subprocess.CalledProcessError:
+                    # 回退到软件编码
+                    print("🔄 硬件编码失败，尝试软件编码...")
+
+                    cmd_software = [
+                        'ffmpeg', '-y',
+                        '-i', 'video.mp4',
+                        '-vf', subtitle_filter,
+                        '-c:v', 'libx264',
+                        '-crf', '23',
+                        '-preset', 'medium',
+                        '-c:a', 'copy',
+                        'output.mp4'
+                    ]
+
+                    result_software = subprocess.run(
+                        cmd_software,
+                        cwd=tmpdir,
+                        capture_output=True,
+                        text=True,
+                        timeout=300
+                    )
+
+                    if result_software.returncode == 0:
+                        shutil.copy2(temp_output, output_path)
+                        print(f"✅ 软件编码成功: {output_path}")
+                        return output_path
+                    else:
+                        raise RuntimeError(f"软件编码失败: {result_software.stderr}")
+
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("FFmpeg 处理超时")
+        except Exception as e:
+            raise RuntimeError(f"烧录字幕失败: {str(e)}")

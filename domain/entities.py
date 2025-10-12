@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Optional
 
 from domain.value_objects import *
 
@@ -8,11 +9,19 @@ class Subtitle:
     """字幕实体（不可变）"""
     segments: tuple[TextSegment, ...]  # 使用 tuple 保证不可变
     language: LanguageCode
+    path: Optional[Path] = None
 
     def __post_init__(self):
         if not self.segments:
             raise ValueError("segments cannot be empty")
 
+    def with_path(self, path: Path) -> 'Subtitle':
+        """返回带有新路径的 Subtitle 副本"""
+        return Subtitle(
+            segments=self.segments,
+            language=self.language,
+            path=path
+        )
 
 @dataclass(frozen=True)
 class AudioTrack:

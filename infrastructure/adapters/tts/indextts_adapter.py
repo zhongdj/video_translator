@@ -150,17 +150,27 @@ class IndexTTSAdapter(TTSProvider):
 
         return DummyModel()
 
-
     def unload(self) -> None:
         """卸载模型"""
         if not self._is_loaded:
             return
 
+        # 打印统计信息
+        if self.stats["total_texts"] > 0:
+            avg_time = self.stats["total_time"] / self.stats["total_texts"]
+            print(f"\n📊 性能统计:")
+            print(f"   总文本数: {self.stats['total_texts']}")
+            print(f"   总批次数: {self.stats['total_batches']}")
+            print(f"   总耗时: {self.stats['total_time']:.2f}秒")
+            print(f"   平均: {avg_time:.3f}秒/文本")
+            print(f"   峰值内存: {self.stats['peak_memory_gb']:.2f}GB")
+            if self.stats['oom_count'] > 0:
+                print(f"   ⚠️ OOM次数: {self.stats['oom_count']}")
+
         if self.model is not None:
             del self.model
             self.model = None
 
-        import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -181,7 +191,8 @@ class IndexTTSAdapter(TTSProvider):
         results = self.batch_synthesize(
             texts=[text],
             reference_audio_path=voice_profile.reference_audio_path,
-            language=voice_profile.language
+            language=voice_profile.language,
+            batch_size=1
         )
 
         return results[0]
@@ -216,7 +227,7 @@ class IndexTTSAdapter(TTSProvider):
         if len(texts) < suggested:
             suggested = len(texts)
 
-        return int(suggested / 2)
+        return int(suggested/4)
 
     def batch_synthesize(
             self,
@@ -359,6 +370,13 @@ class IndexTTSAdapter(TTSProvider):
                     sample_rate=sampling_rate
                 )
                 all_audio_samples.append(audio_sample)
+
+            # 🔧 清理批次中间结果，释放显存
+            del batch_results
+
+            # 主动清理 CUDA 缓存（每个批次后）
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # 更新统计
         total_time = time.perf_counter() - batch_start_time

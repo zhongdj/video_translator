@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import List, Optional
 
 
-def batch_infer_same_speaker(
+def batch_infer_same_speaker2(
         self,
         texts: List[str],
         spk_audio_prompt: str,

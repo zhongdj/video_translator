@@ -11,7 +11,7 @@
 - 传统方式：N个视频 × 3个模型 = 3N次加载
 - 优化方式：3个模型各加载1次 = 3次加载
 """
-
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Callable
@@ -469,13 +469,14 @@ def stage3_batch_synthesis(
         video_audios: tuple[VideoWithAudio, ...],
         video_processor: VideoProcessor,
         subtitle_writer: SubtitleWriter,
+        cache_repo: CacheRepository,  # 新增缓存仓储参数
         output_dir: Path,
         progress: Optional[Callable[[float, str], None]] = None
 ) -> tuple[ProcessedVideo, ...]:
     """
-    阶段3: 批量视频合成
+    阶段3: 批量视频合成（带缓存和断点续传）
 
-    为所有视频生成字幕文件和最终视频
+    为所有视频生成字幕文件和最终视频，支持断点续传
     """
     if progress:
         progress(0.0, "阶段3: 批量视频合成")
@@ -489,49 +490,160 @@ def stage3_batch_synthesis(
         if progress:
             progress(video_progress, f"合成: 处理视频 {idx + 1}/{total} - {va.video.path.name}")
 
-        # 创建双语字幕
-        bilingual = merge_bilingual_subtitles(
-            va.translated_subtitle,
-            va.original_subtitle
+        # 检查视频合成缓存
+        cache_key = calculate_cache_key(
+            va.video.path,
+            "video_synthesis",
+            {
+                "subtitles_hash": hash((va.original_subtitle, va.translated_subtitle)),
+                "audio_track_hash": hash(va.audio_track) if va.audio_track else "no_audio",
+                "output_dir": str(output_dir)
+            }
         )
 
-        # 执行视频合成
-        from application.use_cases.synthesize_video_use_case import synthesize_video_use_case
+        cache_hit = cache_repo.exists(cache_key)
+        processed_video = None
 
-        synthesis_result = synthesize_video_use_case(
-            video=va.video,
-            subtitles=(
+        if cache_hit:
+            # 尝试从缓存加载已处理的视频信息
+            try:
+                cached_data = cache_repo.get(cache_key)
+                if cached_data and _validate_cached_video(cached_data, output_dir):
+                    processed_video = _load_processed_video_from_cache(cached_data, va)
+                    print(f"  💾 视频合成缓存命中: {va.video.path.name}")
+            except (KeyError, ValueError, FileNotFoundError) as e:
+                print(f"  ⚠️  视频合成缓存损坏: {e}，重新生成")
+                cache_hit = False
+
+        if not cache_hit:
+            # 创建双语字幕
+            bilingual = merge_bilingual_subtitles(
                 va.translated_subtitle,
-                va.original_subtitle,
-                bilingual
-            ),
-            audio_track=va.audio_track,
-            video_processor=video_processor,
-            subtitle_writer=subtitle_writer,
-            output_dir=output_dir,
-            burn_subtitles=True,
-            progress=None  # 不传递进度，避免过多输出
-        )
+                va.original_subtitle
+            )
 
-        # 构建结果
-        processed = ProcessedVideo(
-            original_video=va.video,
-            subtitles=(
-                va.translated_subtitle,
-                va.original_subtitle,
-                bilingual
-            ),
-            audio_tracks=(va.audio_track,) if va.audio_track else tuple(),
-            output_paths=synthesis_result.output_paths
-        )
+            # 执行视频合成
+            from application.use_cases.synthesize_video_use_case import synthesize_video_use_case
 
-        results.append(processed)
-        print(f"  ✅ 完成: {va.video.path.name}")
+            synthesis_result = synthesize_video_use_case(
+                video=va.video,
+                subtitles=(
+                    va.translated_subtitle,
+                    va.original_subtitle,
+                    bilingual
+                ),
+                audio_track=va.audio_track,
+                video_processor=video_processor,
+                subtitle_writer=subtitle_writer,
+                output_dir=output_dir,
+                burn_subtitles=True,
+                progress=None  # 不传递进度，避免过多输出
+            )
+
+            # 构建结果
+            processed_video = ProcessedVideo(
+                original_video=va.video,
+                subtitles=(
+                    va.translated_subtitle,
+                    va.original_subtitle,
+                    bilingual
+                ),
+                audio_tracks=(va.audio_track,) if va.audio_track else tuple(),
+                output_paths=synthesis_result.output_paths
+            )
+
+            # 保存视频合成缓存
+            _save_video_synthesis_cache(
+                cache_repo=cache_repo,
+                cache_key=cache_key,
+                processed_video=processed_video,
+                output_dir=output_dir
+            )
+
+            print(f"  ✅ 完成: {va.video.path.name}")
+
+        results.append(processed_video)
 
     if progress:
         progress(1.0, f"阶段3完成: 处理了 {total} 个视频")
 
     return tuple(results)
+
+
+def _validate_cached_video(cached_data: dict, output_dir: Path) -> bool:
+    """
+    验证缓存的视频文件是否有效
+
+    Args:
+        cached_data: 缓存数据
+        output_dir: 输出目录
+
+    Returns:
+        bool: 缓存是否有效
+    """
+    try:
+        output_paths = cached_data.get("output_paths", [])
+        if not output_paths:
+            return False
+
+        for path_str in output_paths:
+            output_path = Path(path_str)
+            # 检查文件是否存在且大小合理（至少1KB）
+            if not output_path.exists() or output_path.stat().st_size < 1024:
+                return False
+
+        return True
+    except (KeyError, OSError):
+        return False
+
+
+def _load_processed_video_from_cache(cached_data: dict, va: VideoWithAudio) -> ProcessedVideo:
+    """
+    从缓存加载已处理的视频信息
+
+    Args:
+        cached_data: 缓存数据
+        va: 视频音频中间结果
+
+    Returns:
+        ProcessedVideo: 处理后的视频
+    """
+    output_paths = tuple(Path(path_str) for path_str in cached_data["output_paths"])
+
+    return ProcessedVideo(
+        original_video=va.video,
+        subtitles=(
+            va.translated_subtitle,
+            va.original_subtitle,
+            merge_bilingual_subtitles(va.translated_subtitle, va.original_subtitle)
+        ),
+        audio_tracks=(va.audio_track,) if va.audio_track else tuple(),
+        output_paths=output_paths
+    )
+
+
+def _save_video_synthesis_cache(
+        cache_repo: CacheRepository,
+        cache_key: str,
+        processed_video: ProcessedVideo,
+        output_dir: Path
+) -> None:
+    """
+    保存视频合成缓存
+
+    Args:
+        cache_repo: 缓存仓储
+        cache_key: 缓存键
+        processed_video: 处理后的视频
+        output_dir: 输出目录
+    """
+    cache_data = {
+        "output_paths": [str(path) for path in processed_video.output_paths],
+        "original_video": str(processed_video.original_video.path),
+        "timestamp": datetime.now().isoformat()
+    }
+
+    cache_repo.set(cache_key, cache_data)
 
 
 # ============== 主用例函数 ============== #
@@ -617,6 +729,7 @@ def batch_process_use_case(
         video_audios=video_audios,
         video_processor=video_processor,
         subtitle_writer=subtitle_writer,
+        cache_repo=cache_repo,  # 新增参数
         output_dir=output_dir,
         progress=lambda p, d: progress(0.8 + p * 0.2, d) if progress else None
     )

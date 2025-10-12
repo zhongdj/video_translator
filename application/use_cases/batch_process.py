@@ -202,6 +202,11 @@ def stage1_batch_asr(
     return tuple(results)
 
 
+"""
+优化的 stage2_batch_tts - 使用 batch_infer_same_speaker 批量处理 segments
+"""
+
+
 def stage2_batch_tts(
         video_subtitles: tuple[VideoWithSubtitles, ...],
         tts_provider: TTSProvider,
@@ -211,9 +216,23 @@ def stage2_batch_tts(
         progress: Optional[Callable[[float, str], None]] = None
 ) -> tuple[VideoWithAudio, ...]:
     """
-    阶段2: 批量 TTS（语音克隆）
+    阶段2: 批量 TTS（语音克隆）- 优化版本
 
-    对所有视频执行语音合成，TTS 模型只加载一次
+    关键优化：
+    1. 使用 batch_infer_same_speaker 批量处理同一视频的所有 segments
+    2. 一次性提取并缓存说话人条件，避免重复计算
+    3. 减少 GPU 上下文切换，提高吞吐量
+
+    Args:
+        video_subtitles: 带字幕的视频中间结果
+        tts_provider: TTS 提供者
+        video_processor: 视频处理器
+        cache_repo: 缓存仓储
+        enable_voice_cloning: 是否启用语音克隆
+        progress: 进度回调
+
+    Returns:
+        带音频的视频中间结果
     """
     if progress:
         progress(0.0, "阶段2: 批量语音克隆")
@@ -259,85 +278,28 @@ def stage2_batch_tts(
 
         if cache_hit:
             # 从缓存加载
-            cached = cache_repo.get(cache_key)
+            audio_track = _load_audio_from_cache(
+                cache_repo,
+                cache_key,
+                vs.video.path.name,
+                vs.translated_subtitle.language
+            )
 
-            # 验证缓存数据完整性
-            if cached is None or "audio_samples" not in cached or "sample_rate" not in cached:
-                print(f"  ⚠️  缓存数据损坏，重新生成: {vs.video.path.name}")
+            if audio_track is None:
+                # 缓存损坏，重新生成
                 cache_hit = False
-            else:
-                from domain.entities import AudioSample, VoiceProfile
 
-                try:
-                    audio_sample = AudioSample(
-                        samples=tuple(cached["audio_samples"]),
-                        sample_rate=cached["sample_rate"]
-                    )
-
-                    audio_track = AudioTrack(audio_sample, vs.translated_subtitle.language)
-
-                    print(f"  💾 缓存命中: {vs.video.path.name}")
-                except (KeyError, TypeError) as e:
-                    print(f"  ⚠️  缓存数据解析失败: {e}，重新生成")
-                    cache_hit = False
-
-        # if not cache_hit:
-
-        else:
-            # 提取参考音频
-            reference_audio_path = video_processor.extract_reference_audio(
-                vs.video,
-                10.0
+        if not cache_hit:
+            # 批量合成音频
+            audio_track = _batch_synthesize_segments(
+                vs=vs,
+                tts_provider=tts_provider,
+                video_processor=video_processor,
+                cache_repo=cache_repo,
+                cache_key=cache_key
             )
 
-            # 创建声音配置
-            from domain.entities import VoiceProfile
-
-            voice_profile = VoiceProfile(
-                reference_audio_path=reference_audio_path,
-                language=vs.translated_subtitle.language,
-                duration=10.0
-            )
-
-            # 逐句合成
-            synthesized_segments = []
-            for seg_idx, segment in enumerate(vs.translated_subtitle.segments):
-                audio_sample = tts_provider.synthesize(
-                    text=segment.text,
-                    voice_profile=voice_profile,
-                    target_duration=segment.time_range.duration
-                )
-                synthesized_segments.append((audio_sample, segment))
-
-            # 拼接音频
-            total_samples = int(vs.video.duration * synthesized_segments[0][0].sample_rate)
-            full_audio_list = [0.0] * total_samples
-
-            for audio_sample, segment in synthesized_segments:
-                start_idx = int(segment.time_range.start_seconds * audio_sample.sample_rate)
-                for i, sample in enumerate(audio_sample.samples):
-                    if start_idx + i < total_samples:
-                        full_audio_list[start_idx + i] = sample
-
-            from domain.entities import AudioSample
-
-            full_audio = AudioSample(
-                samples=tuple(full_audio_list),
-                sample_rate=synthesized_segments[0][0].sample_rate
-            )
-
-            # 保存缓存
-            cache_data = {
-                "audio_samples": list(full_audio.samples),
-                "sample_rate": full_audio.sample_rate,
-                "reference_audio": str(reference_audio_path),
-                "reference_duration": 10.0
-            }
-            cache_repo.set(cache_key, cache_data)
-
-            audio_track = AudioTrack(full_audio, vs.translated_subtitle.language)
-
-            print(f"  ✅ 完成: {vs.video.path.name}")
+            print(f"  ✅ 完成: {vs.video.path.name} (批量处理 {len(vs.translated_subtitle.segments)} 个片段)")
 
         # 构建中间结果
         result = VideoWithAudio(
@@ -354,6 +316,153 @@ def stage2_batch_tts(
         progress(1.0, f"阶段2完成: 处理了 {total} 个视频")
 
     return tuple(results)
+
+
+def _load_audio_from_cache(
+        cache_repo: CacheRepository,
+        cache_key: str,
+        video_name: str,
+        language: LanguageCode
+) -> Optional[AudioTrack]:
+    """从缓存加载音频轨道"""
+    try:
+        cached = cache_repo.get(cache_key)
+
+        if cached is None or "audio_samples" not in cached or "sample_rate" not in cached:
+            print(f"  ⚠️  缓存数据损坏，重新生成: {video_name}")
+            return None
+
+        from domain.entities import AudioSample
+
+        audio_sample = AudioSample(
+            samples=tuple(cached["audio_samples"]),
+            sample_rate=cached["sample_rate"]
+        )
+
+        audio_track = AudioTrack(audio_sample, language)
+
+        print(f"  💾 缓存命中: {video_name}")
+        return audio_track
+
+    except (KeyError, TypeError) as e:
+        print(f"  ⚠️  缓存数据解析失败: {e}，重新生成")
+        return None
+
+
+def _batch_synthesize_segments(
+        vs: VideoWithSubtitles,
+        tts_provider: TTSProvider,
+        video_processor: VideoProcessor,
+        cache_repo: CacheRepository,
+        cache_key: str
+) -> AudioTrack:
+    """
+    批量合成音频片段 - 核心优化逻辑
+
+    关键步骤：
+    1. 提取参考音频（一次性）
+    2. 准备批量文本列表
+    3. 调用 batch_infer_same_speaker（一次性处理所有 segments）
+    4. 将生成的音频片段拼接到完整音频
+    """
+    # 1. 提取参考音频
+    reference_audio_path = video_processor.extract_reference_audio(
+        vs.video,
+        duration=10.0
+    )
+
+    # 2. 准备批量文本
+    segments = vs.translated_subtitle.segments
+    texts = [segment.text for segment in segments]
+
+    print(f"  🎤 批量合成: {len(texts)} 个片段")
+
+    # 3. 调用批量推理（核心优化点）
+    synthesized_audios = tts_provider.batch_synthesize(
+        texts=texts,
+        reference_audio_path=reference_audio_path,
+        language=vs.translated_subtitle.language
+    )
+
+    # 4. 构建完整音频轨道
+    audio_track = _assemble_full_audio(
+        synthesized_audios=synthesized_audios,
+        segments=segments,
+        video_duration=vs.video.duration,
+        language=vs.translated_subtitle.language
+    )
+
+    # 5. 保存缓存
+    _save_audio_to_cache(
+        cache_repo=cache_repo,
+        cache_key=cache_key,
+        audio_track=audio_track,
+        reference_audio_path=reference_audio_path
+    )
+
+    return audio_track
+
+
+def _assemble_full_audio(
+        synthesized_audios: tuple,
+        segments: tuple,
+        video_duration: float,
+        language: LanguageCode
+) -> AudioTrack:
+    """
+    将批量合成的音频片段拼接成完整音频
+
+    Args:
+        synthesized_audios: batch_synthesize 返回的音频列表
+        segments: 对应的字幕片段
+        video_duration: 视频总时长
+        language: 目标语言
+
+    Returns:
+        完整的音频轨道
+    """
+    from domain.entities import AudioSample
+
+    # 获取采样率（假设所有片段采样率相同）
+    sample_rate = synthesized_audios[0].sample_rate
+
+    # 初始化完整音频数组
+    total_samples = int(video_duration * sample_rate)
+    full_audio_list = [0.0] * total_samples
+
+    # 按时间轴放置每个音频片段
+    for audio_sample, segment in zip(synthesized_audios, segments):
+        start_idx = int(segment.time_range.start_seconds * sample_rate)
+
+        # 复制音频数据到对应位置
+        for i, sample in enumerate(audio_sample.samples):
+            target_idx = start_idx + i
+            if target_idx < total_samples:
+                full_audio_list[target_idx] = sample
+
+    # 构建完整音频
+    full_audio = AudioSample(
+        samples=tuple(full_audio_list),
+        sample_rate=sample_rate
+    )
+
+    return AudioTrack(full_audio, language)
+
+
+def _save_audio_to_cache(
+        cache_repo: CacheRepository,
+        cache_key: str,
+        audio_track: AudioTrack,
+        reference_audio_path: Path
+) -> None:
+    """保存音频到缓存"""
+    cache_data = {
+        "audio_samples": list(audio_track.audio.samples),
+        "sample_rate": audio_track.audio.sample_rate,
+        "reference_audio": str(reference_audio_path),
+        "reference_duration": 10.0
+    }
+    cache_repo.set(cache_key, cache_data)
 
 
 def stage3_batch_synthesis(

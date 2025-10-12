@@ -1,4 +1,5 @@
 # ============== Ports (接口定义) ============== #
+from abc import ABC, abstractmethod
 from typing import Protocol, Optional
 
 from domain.entities import *
@@ -37,9 +38,10 @@ class TranslationProvider(Protocol):
         ...
 
 
-class TTSProvider(Protocol):
-    """文本转语音提供者接口"""
+class TTSProvider(ABC):
+    """TTS 提供者接口"""
 
+    @abstractmethod
     def synthesize(
             self,
             text: str,
@@ -47,13 +49,52 @@ class TTSProvider(Protocol):
             target_duration: Optional[float] = None
     ) -> AudioSample:
         """
-        合成语音
+        单句合成
+
         Args:
-            text: 要合成的文本
+            text: 待合成文本
             voice_profile: 声音配置
-            target_duration: 目标时长（秒），用于时长对齐
+            target_duration: 目标时长
+
+        Returns:
+            合成的音频
         """
-        ...
+        pass
+
+    @abstractmethod
+    def batch_synthesize(
+            self,
+            texts: list[str],
+            reference_audio_path: Path,
+            language: LanguageCode
+    ) -> tuple[AudioSample, ...]:
+        """
+        批量合成（同一说话人）
+
+        关键优化：
+        1. 说话人条件只提取一次
+        2. 所有文本批量推理
+        3. 减少 GPU 上下文切换
+
+        Args:
+            texts: 待合成文本列表
+            reference_audio_path: 参考音频路径
+            language: 目标语言
+
+        Returns:
+            合成的音频列表（顺序与输入一致）
+        """
+        pass
+
+    @abstractmethod
+    def load(self) -> None:
+        """加载模型"""
+        pass
+
+    @abstractmethod
+    def unload(self) -> None:
+        """卸载模型"""
+        pass
 
 
 class VideoProcessor(Protocol):

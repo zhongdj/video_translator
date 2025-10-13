@@ -37,6 +37,12 @@ class TranslationProvider(Protocol):
         """翻译文本片段"""
         ...
 
+    def unload(self):
+        """
+        释放内存
+        :return:
+        """
+
 
 class TTSProvider(ABC):
     """TTS 提供者接口"""

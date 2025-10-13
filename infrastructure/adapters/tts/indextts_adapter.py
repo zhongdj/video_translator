@@ -188,14 +188,113 @@ class IndexTTSAdapter(TTSProvider):
             self.load()
 
         # 调用批量接口（batch_size=1）
-        results = self.batch_synthesize(
-            texts=[text],
-            reference_audio_path=voice_profile.reference_audio_path,
-            language=voice_profile.language,
-            batch_size=1
-        )
+        # results = self.batch_synthesize(
+        #     texts=[text],
+        #     reference_audio_path=voice_profile.reference_audio_path,
+        #     language=voice_profile.language,
+        #     batch_size=None
+        # )
+        import time
+        output_path = self.output_dir / f"tts_output_{int(time.time())}_{hash(text) % 100000}.wav"
+        print(f" **** {output_path}")
+        # result = self.model.infer(
+        #     spk_audio_prompt=str(voice_profile.reference_audio_path),
+        #     text=text,
+        #     output_path=str(output_path),
+        #     verbose=True
+        # )
+        #
+        # # return results[0]
+        # audio_data, sample_rate = self._handle_model_output(result, output_path)
+        # return AudioSample(tuple(audio_data.tolist()), sample_rate)
 
-        return results[0]
+        # 🔥 关键修复
+        def synthesize(
+                self,
+                text: str,
+                voice_profile: VoiceProfile,
+                target_duration: Optional[float] = None
+        ) -> AudioSample:
+            """单句合成（兼容旧接口）- 保存文件版本"""
+            if not self._is_loaded:
+                self.load()
+
+            import time
+
+            # 生成输出文件路径
+            output_path = self.output_dir / f"tts_output_{int(time.time())}_{hash(text) % 100000}.wav"
+
+            # 🔥 如果指定 output_paths，返回的是文件路径列表
+            batch_results = self.model.batch_infer_same_speaker(
+                texts=[text],
+                spk_audio_prompt=str(voice_profile.reference_audio_path),
+                output_paths=[str(output_path)],  # ✅ 指定输出路径
+                emo_audio_prompt=str(voice_profile.reference_audio_path),
+                emo_alpha=1.0,
+                interval_silence=0,
+                verbose=True,
+                max_text_tokens_per_segment=120,
+                do_sample=True,
+                top_p=0.8,
+                top_k=30,
+                temperature=0.8,
+                length_penalty=0.0,
+                num_beams=3,
+                repetition_penalty=10.0,
+                max_mel_tokens=1500
+            )
+
+            # batch_results[0] 现在是文件路径字符串
+            output_file = batch_results[0]
+
+            print(f"📁 音频已保存到: {output_file}")
+
+            # 从文件加载音频
+            import torchaudio
+            wav_tensor, sampling_rate = torchaudio.load(output_file)
+
+            print(f"\n📊 加载的音频信息:")
+            print(f"   采样率: {sampling_rate}")
+            print(f"   Tensor shape: {wav_tensor.shape}")
+            print(f"   Tensor dtype: {wav_tensor.dtype}")
+
+            # 转换为 numpy
+            wav_data = wav_tensor.numpy()
+
+            # 🔧 维度处理
+            if wav_data.ndim == 2:
+                if wav_data.shape[0] < wav_data.shape[1]:
+                    # (channels, samples)
+                    wav_data = wav_data[0, :]
+                    print(f"   取第一声道: {wav_data.shape}")
+                else:
+                    # (samples, channels)
+                    wav_data = wav_data[:, 0]
+                    print(f"   取第一列: {wav_data.shape}")
+
+            # 🔧 归一化（如果是 int16）
+            if wav_data.dtype == np.int16:
+                print(f"   🔧 int16 -> float64 归一化")
+                wav_data = wav_data.astype(np.float64) / 32767.0
+
+            # 🔧 验证范围
+            max_val = np.abs(wav_data).max()
+            if max_val > 1.0:
+                print(f"   ⚠️  音频峰值 {max_val:.1f} 超出范围，归一化")
+                wav_data = wav_data / max_val
+
+            print(f"   最终范围: [{wav_data.min():.4f}, {wav_data.max():.4f}]")
+
+            # 创建 AudioSample
+            audio_sample = AudioSample(
+                samples=tuple(float(s) for s in wav_data.flatten()),
+                sample_rate=sampling_rate
+            )
+
+            print(f"✅ AudioSample 创建成功: {len(audio_sample.samples)} 样本\n")
+
+            return audio_sample
+
 
     def suggest_batch_size(self, texts: list[str]) -> int:
         """
@@ -227,7 +326,7 @@ class IndexTTSAdapter(TTSProvider):
         if len(texts) < suggested:
             suggested = len(texts)
 
-        return int(suggested/4)
+        return max(1, int(suggested/4))
 
     def batch_synthesize(
             self,
@@ -314,6 +413,7 @@ class IndexTTSAdapter(TTSProvider):
     ) -> tuple[AudioSample, ...]:
         """实际执行批量合成"""
 
+        print(f"  ⚠️  refence audio path: {str(reference_audio_path)}")
         total_texts = len(texts)
         all_audio_samples = []
         num_batches = (total_texts + batch_size - 1) // batch_size
@@ -338,7 +438,7 @@ class IndexTTSAdapter(TTSProvider):
                 emo_audio_prompt=None,
                 emo_alpha=1.0,
                 interval_silence=0,
-                verbose=False,
+                verbose=True,
                 max_text_tokens_per_segment=120,
                 do_sample=True,
                 top_p=0.8,
@@ -399,3 +499,44 @@ class IndexTTSAdapter(TTSProvider):
             self.gpt_config['top_p'] = top_p
         if speed is not None:
             self.speed = speed
+
+    def _handle_model_output(self, result, output_path: Path) -> Tuple[np.ndarray, int]:
+        """处理模型输出，适应不同的返回类型"""
+        print(f"🔧 处理模型输出，类型: {type(result)}")
+
+        # 如果返回的是路径，读取音频文件
+        if isinstance(result, (str, Path)):
+            audio_path = Path(result)
+            if audio_path.exists():
+                print(f"📁 从文件读取音频: {audio_path}")
+                audio_data, sample_rate = torchaudio.load(audio_path)
+                audio_data = audio_data.numpy()[0]  # 转换为numpy并取第一个通道
+                return audio_data, sample_rate
+            else:
+                raise FileNotFoundError(f"音频文件不存在: {audio_path}")
+
+        # 如果返回的是元组 (audio_data, sample_rate)
+        elif isinstance(result, tuple) and len(result) == 2:
+            audio_data, sample_rate = result
+
+            # 处理torch tensor
+            if torch.is_tensor(audio_data):
+                audio_data = audio_data.cpu().numpy()
+
+            # 确保是单声道
+            if audio_data.ndim > 1:
+                audio_data = audio_data[0]  # 取第一个通道
+
+            return audio_data, sample_rate
+
+        # 如果返回的是单个值（可能是音频数据），假设采样率为22050
+        else:
+            print(f"⚠️ 未知返回类型，尝试处理...")
+            audio_data = result
+            if torch.is_tensor(audio_data):
+                audio_data = audio_data.cpu().numpy()
+
+            if audio_data.ndim > 1:
+                audio_data = audio_data[0]
+
+            return audio_data, 22050

@@ -338,18 +338,18 @@ def test_whisper_adapter_integration():
 def test_full_video_processing():
     """端到端测试（真实依赖）"""
     container = DependencyContainer()
-    
+
     video = Video(path=Path("test.mp4"), duration=10.0, has_audio=True)
-    
+
     result = generate_subtitles_use_case(
         video=video,
         asr_provider=container.get_asr("tiny"),
         translation_provider=container.get_translator(),
         cache_repo=container.cache_repo
     )
-    
-    assert result.translated_subtitle is not None
-    assert len(result.translated_subtitle.segments) > 0
+
+    assert result.translated_en_subtitle is not None
+    assert len(result.translated_en_subtitle.segments) > 0
 ```
 
 ---

@@ -263,6 +263,7 @@ def batch_process_videos_ui(
         whisper_model: str,
         translation_model: str,
         enable_voice: bool,
+        reference_audio_file: Path,
         progress=gr.Progress()
 ):
     """批量处理 UI 处理函数"""
@@ -307,6 +308,7 @@ def batch_process_videos_ui(
             cache_repo=container.cache_repo,
             output_dir=output_dir,
             enable_voice_cloning=enable_voice,
+            reference_audio_file=reference_audio_file,
             progress=prog_callback
         )
 
@@ -700,9 +702,22 @@ def build_ui():
                             label="🌐 翻译模型"
                         )
 
-                    batch_enable_voice = gr.Checkbox(
-                        label="🎤 启用语音克隆",
-                        value=False
+                    with gr.Row():
+                        batch_enable_voice = gr.Checkbox(
+                            label="🎤 启用语音克隆",
+                            value=False
+                        )
+                        reference_audio_input = gr.File(
+                            label="🎵 参考音频（可选，留空则自动提取）",
+                            file_types=[".wav", ".mp3"],
+                            visible=False
+                        )
+
+                    # 动态显示参考音频上传
+                    batch_enable_voice.change(
+                        lambda x: gr.update(visible=x),
+                        inputs=[batch_enable_voice],
+                        outputs=[reference_audio_input]
                     )
 
                     batch_btn = gr.Button("▶️ 开始批量处理", variant="primary", size="lg")
@@ -717,7 +732,8 @@ def build_ui():
                     batch_videos,
                     batch_whisper,
                     batch_translation,
-                    batch_enable_voice
+                    batch_enable_voice,
+                    reference_audio_input
                 ],
                 outputs=[batch_output, batch_log]
             )

@@ -55,9 +55,10 @@ class QwenTranslationAdapter:
         model, tokenizer = self._load_model()
 
         # 批量翻译
-        batch_size = 16
+        batch_size = len(segments)
         translated_segments = []
 
+        print(f" Translating {len(segments)} segments in {batch_size} batch")
         for i in range(0, len(segments), batch_size):
             batch = segments[i:i + batch_size]
 

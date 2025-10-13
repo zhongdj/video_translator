@@ -10,7 +10,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional, Callable, List, Tuple
 from datetime import datetime
 
 from domain.entities import (
@@ -40,11 +40,11 @@ class VideoWithSubtitles:
     - secondary_subtitle: 次要语言字幕（英文）
     """
     video: Video
-    original_subtitle: Subtitle      # 原始识别语言（zh/en/pt/ja等）
-    target_subtitle: Subtitle        # 目标语言（中文）
-    secondary_subtitle: Subtitle     # 次要语言（英文）
+    original_subtitle: Subtitle  # 原始识别语言（zh/en/pt/ja等）
+    target_subtitle: Subtitle  # 目标语言（中文）
+    secondary_subtitle: Subtitle  # 次要语言（英文）
     detected_language: LanguageCode
-    cache_hit_subtitle: bool
+    cache_hit_subtitle: bool = False
 
 
 @dataclass(frozen=True)
@@ -52,8 +52,8 @@ class VideoWithAudio:
     """视频 + 字幕 + 音频的中间结果"""
     video: Video
     original_subtitle: Subtitle
-    target_subtitle: Subtitle        # 中文字幕
-    secondary_subtitle: Subtitle     # 英文字幕
+    target_subtitle: Subtitle  # 中文字幕
+    secondary_subtitle: Subtitle  # 英文字幕
     detected_language: LanguageCode
     audio_track: Optional[AudioTrack]
     cache_hit_audio: bool
@@ -128,6 +128,21 @@ def _serialize_segments(segments: tuple[TextSegment, ...]) -> list:
         }
         for seg in segments
     ]
+
+
+def _deserialize_segments(data: List[dict], language: LanguageCode) -> Tuple[TextSegment, ...]:
+    """把缓存里的 dict 列表还原成 TextSegment 元组。"""
+    return tuple(
+        TextSegment(
+            text=item["text"],
+            time_range=TimeRange(
+                start_seconds=item["start"],
+                end_seconds=item["end"],
+            ),
+            language=language
+        )
+        for item in data
+    )
 
 
 # ============== 字幕翻译策略函数 ============== #
@@ -308,7 +323,7 @@ def _batch_synthesize_segments(
     """批量合成音频片段（使用中文字幕）"""
 
     reference_audio_path = reference_audio_file
-    #video_processor.extract_reference_audio(vs.video, duration=10.0)
+    # video_processor.extract_reference_audio(vs.video, duration=10.0)
 
     # ✅ 使用目标语言（中文）字幕
     segments = vs.target_subtitle.segments
@@ -317,7 +332,8 @@ def _batch_synthesize_segments(
     print(f"  🎤 批量合成中文配音: {len(texts)} 个片段")
 
     # 批量合成
-    synthesized_audios = tts_provider.batch_synthesize(texts=texts, reference_audio_path=reference_audio_path, language=vs.target_subtitle.language)
+    synthesized_audios = tts_provider.batch_synthesize(texts=texts, reference_audio_path=reference_audio_path,
+                                                       language=vs.target_subtitle.language)
 
     # 拼接完整音频
     audio_track = _assemble_full_audio(
@@ -362,6 +378,136 @@ def _skip_voice_cloning(
 
 
 # ============== 阶段性处理函数 ============== #
+def phase1_extract_asr(
+        videos: List[Video],
+        cache_repo: CacheRepository,
+        video_processor: VideoProcessor,
+        asr_provider: ASRProvider,
+        progress: Optional[Callable[[float, str], None]] = None,
+) -> Tuple[VideoWithSubtitles, ...]:
+    """
+    音频提取 + ASR，结果落盘并返回 VideoWithSubtitles（原始字幕）。
+    """
+    total = len(videos)
+    out: List[VideoWithSubtitles] = []
+
+    for idx, video in enumerate(videos):
+        if progress:
+            progress(idx / total, f"Phase-1 ASR: {idx + 1}/{total}  {video.path.name}")
+
+        cache_key = calculate_cache_key(video.path, "phase1_asr", {})
+        if cache_repo.exists(cache_key):
+            try:
+                cached = cache_repo.get(cache_key)
+                detected_lang = LanguageCode(cached["detected_language"])
+                original_sub = Subtitle(
+                    segments=_deserialize_segments(cached["segments"], detected_lang),
+                    language=detected_lang,
+                )
+                out.append(VideoWithSubtitles(video, original_sub, None, None, detected_lang, True))
+                print(f"  💾 Phase-1 缓存命中: {video.path.name}")
+                continue
+            except (KeyError, ValueError):
+                print(f"  ⚠️  Phase-1 缓存损坏，重新生成: {video.path.name}")
+
+        # 真正干活
+        audio_path = video_processor.extract_audio(video)
+        segments, detected_lang = asr_provider.transcribe(audio_path)
+        cache_repo.set(cache_key, {
+            "detected_language": detected_lang.value,
+            "segments": _serialize_segments(segments),
+        })
+        original_sub = Subtitle(segments, detected_lang)
+        out.append(VideoWithSubtitles(video, original_sub, None, None, detected_lang, False))
+        print(f"  ✅ Phase-1 完成: {video.path.name}  ({detected_lang.value})")
+
+    return tuple(out)
+
+
+from typing import List, Optional, Tuple
+from tqdm import tqdm  # 可选，进度条更漂亮
+
+
+def phase2_translate(
+        videos: List[Video],
+        cache_repo: CacheRepository,
+        translation_provider: TranslationProvider,
+        target_language: LanguageCode = LanguageCode.CHINESE,
+        progress: Optional[Callable[[float, str], None]] = None,
+) -> Tuple[VideoWithSubtitles, ...]:
+    """
+    读取 Phase-1 缓存 → 翻译（或缓存命中）→ 返回 VideoWithSubtitles 元组
+    """
+    total = len(videos)
+    out: List[VideoWithSubtitles] = []
+
+    for idx, video in enumerate(videos):
+        if progress:
+            progress(idx / total, f"Phase-2 Trans: {idx + 1}/{total}  {video.path.name}")
+
+        # 1. Phase-2 缓存 key
+        trans_key = calculate_cache_key(
+            video.path,
+            "phase2_trans",
+            {"target_language": target_language.value},
+        )
+
+        # 2. 读 Phase-1 原始字幕（必须存在）
+        asr_key = calculate_cache_key(video.path, "phase1_asr", {})
+        if not cache_repo.exists(asr_key):
+            raise RuntimeError(f"Phase-1 缓存缺失，无法翻译: {video.path.name}")
+        asr_cached = cache_repo.get(asr_key)
+        detected_lang = LanguageCode(asr_cached["detected_language"])
+        original_sub = Subtitle(
+            segments=_deserialize_segments(asr_cached["segments"], detected_lang),
+            language=detected_lang,
+        )
+
+        # 3. 如果 Phase-2 已存在，直接还原
+        if cache_repo.exists(trans_key):
+            try:
+                trans_cached = cache_repo.get(trans_key)
+                zh_sub = Subtitle(
+                    segments=_deserialize_segments(trans_cached["zh_segments"], _deserialize_segments),
+                    language=LanguageCode.CHINESE,
+                )
+                en_sub = Subtitle(
+                    segments=_deserialize_segments(trans_cached["en_segments"], _deserialize_segments),
+                    language=LanguageCode.ENGLISH,
+                )
+                out.append(VideoWithSubtitles(video, original_sub, zh_sub, en_sub, detected_lang, True))
+                print(f"  💾 Phase-2 缓存命中: {video.path.name}")
+                continue
+            except (KeyError, ValueError):
+                print(f"  ⚠️  Phase-2 缓存损坏，重新翻译: {video.path.name}")
+
+        # 4. 真正翻译
+        zh_sub, en_sub = _translate_subtitles(
+            original_sub.segments,
+            detected_lang,
+            translation_provider,
+        )
+
+        # 5. 写 Phase-2 缓存
+        cache_repo.set(
+            trans_key,
+            {
+                "zh_segments": _serialize_segments(zh_sub.segments),
+                "en_segments": _serialize_segments(en_sub.segments),
+            },
+        )
+        out.append(out.append(VideoWithSubtitles(
+            video=video,
+            original_subtitle=original_sub,
+            target_subtitle=zh_sub,  # 中文留空
+            secondary_subtitle=en_sub,  # 英文留空
+            detected_language=detected_lang,
+            cache_hit_subtitle=False  # 或 False，视你逻辑而定
+        )))
+        print(f"  ✅ Phase-2 完成: {video.path.name}")
+
+    return tuple(out)
+
 
 def stage1_batch_asr(
         videos: tuple[Video, ...],
@@ -380,69 +526,71 @@ def stage1_batch_asr(
     results = []
     total = len(videos)
 
-    for idx, video in enumerate(videos):
-        if progress:
-            progress(idx / total, f"ASR: 处理视频 {idx + 1}/{total} - {video.path.name}")
+    # for idx, video in enumerate(videos):
+    #     if progress:
+    #         progress(idx / total, f"ASR: 处理视频 {idx + 1}/{total} - {video.path.name}")
+    #
+    #     cache_key = calculate_cache_key(
+    #         video.path,
+    #         "subtitles",
+    #         {"target_language": target_language.value, "source_language": "auto"}
+    #     )
+    #
+    #     cache_hit = cache_repo.exists(cache_key)
+    #
+    #     if cache_hit:
+    #         try:
+    #             cached = cache_repo.get(cache_key)
+    #             detected_lang = LanguageCode(cached["detected_language"])
+    #
+    #             original_subtitle, target_subtitle, secondary_subtitle = \
+    #                 _reconstruct_subtitles_from_cache(cached, detected_lang)
+    #
+    #             print(f"  💾 字幕缓存命中: {video.path.name}")
+    #
+    #         except (KeyError, ValueError) as e:
+    #             print(f"  ⚠️  字幕缓存损坏: {e}，重新生成")
+    #             cache_hit = False
+    #
+    #     if not cache_hit:
+    #         audio_path = video_processor.extract_audio(video)
+    #         original_segments, detected_lang = asr_provider.transcribe(audio_path)
+    #
+    #         original_subtitle = Subtitle(original_segments, detected_lang)
+    #         target_subtitle, secondary_subtitle = _translate_subtitles(
+    #             original_segments,
+    #             detected_lang,
+    #             translation_provider
+    #         )
+    #
+    #         cache_data = {
+    #             "detected_language": detected_lang.value,
+    #             "zh_segments": _serialize_segments(target_subtitle.segments),
+    #             "en_segments": _serialize_segments(secondary_subtitle.segments)
+    #         }
+    #
+    #         if detected_lang not in [LanguageCode.CHINESE, LanguageCode.ENGLISH]:
+    #             cache_data[f"{detected_lang.value}_segments"] = _serialize_segments(original_segments)
+    #
+    #         cache_repo.set(cache_key, cache_data)
+    #         print(f"  ✅ 完成: {video.path.name} ({detected_lang.value} -> zh, en)")
+    videos_with_orig = phase1_extract_asr(list(videos), cache_repo, video_processor, asr_provider, progress)
+    asr_provider.unload()
 
-        cache_key = calculate_cache_key(
-            video.path,
-            "subtitles",
-            {"target_language": target_language.value, "source_language": "auto"}
-        )
-
-        cache_hit = cache_repo.exists(cache_key)
-
-        if cache_hit:
-            try:
-                cached = cache_repo.get(cache_key)
-                detected_lang = LanguageCode(cached["detected_language"])
-
-                original_subtitle, target_subtitle, secondary_subtitle = \
-                    _reconstruct_subtitles_from_cache(cached, detected_lang)
-
-                print(f"  💾 字幕缓存命中: {video.path.name}")
-
-            except (KeyError, ValueError) as e:
-                print(f"  ⚠️  字幕缓存损坏: {e}，重新生成")
-                cache_hit = False
-
-        if not cache_hit:
-            audio_path = video_processor.extract_audio(video)
-            original_segments, detected_lang = asr_provider.transcribe(audio_path, None)
-
-            original_subtitle = Subtitle(original_segments, detected_lang)
-            target_subtitle, secondary_subtitle = _translate_subtitles(
-                original_segments,
-                detected_lang,
-                translation_provider
-            )
-
-            cache_data = {
-                "detected_language": detected_lang.value,
-                "zh_segments": _serialize_segments(target_subtitle.segments),
-                "en_segments": _serialize_segments(secondary_subtitle.segments)
-            }
-
-            if detected_lang not in [LanguageCode.CHINESE, LanguageCode.ENGLISH]:
-                cache_data[f"{detected_lang.value}_segments"] = _serialize_segments(original_segments)
-
-            cache_repo.set(cache_key, cache_data)
-            print(f"  ✅ 完成: {video.path.name} ({detected_lang.value} -> zh, en)")
-
-        result = VideoWithSubtitles(
-            video=video,
-            original_subtitle=original_subtitle,
-            target_subtitle=target_subtitle,
-            secondary_subtitle=secondary_subtitle,
-            detected_language=detected_lang,
-            cache_hit_subtitle=cache_hit
-        )
-        results.append(result)
+    videos_with_subs = phase2_translate(
+        videos=[vws.video for vws in videos_with_orig],
+        cache_repo=cache_repo,
+        translation_provider=translation_provider,
+        target_language=target_language,
+        progress=lambda ratio, msg: print(f"{ratio:.1%} {msg}"),
+    )
+    translation_provider.unload()
 
     if progress:
         progress(1.0, f"阶段1完成: 处理了 {total} 个视频")
 
-    return tuple(results)
+    del video_processor, asr_provider, translation_provider
+    return tuple(videos_with_subs)
 
 
 def stage2_batch_tts(
@@ -518,6 +666,7 @@ def stage2_batch_tts(
     if progress:
         progress(1.0, f"阶段2完成: 处理了 {total} 个视频")
 
+    tts_provider.unload()
     return tuple(results)
 
 
@@ -622,7 +771,7 @@ def batch_process_use_case(
     print(f"🎤 阶段2: 批量语音克隆")
     video_audios = stage2_batch_tts(
         video_subtitles, tts_provider, video_processor,
-        cache_repo, enable_voice_cloning,reference_audio_file,
+        cache_repo, enable_voice_cloning, reference_audio_file,
         lambda p, d: progress(0.4 + p * 0.4, d) if progress else None
     )
     print(f"✅ 阶段2完成\n")

@@ -10,9 +10,10 @@ from domain.entities import (
     TextSegment,
     # Value Objects
     TimeRange, LanguageCode, )
+from domain.ports import ASRProvider
 
 
-class WhisperASRAdapter:
+class WhisperASRAdapter(ASRProvider):
     """Whisper ASR 适配器"""
 
     def __init__(self, model_size: str = "large-v3", device: str = "cuda"):  # 改为可选
@@ -47,9 +48,7 @@ class WhisperASRAdapter:
     ) -> tuple[tuple[TextSegment, ...], LanguageCode]:
         """实现 ASRProvider 接口"""
 
-        # 每次重新加载模型（模仿原项目）
-        print(f"🔄 加载 Whisper 模型: {self.model_size}")
-        model = whisper.load_model(self.model_size, device=self.device)
+        model = self._load_model()
 
         # 转录参数
         options = {
@@ -62,7 +61,9 @@ class WhisperASRAdapter:
             options["language"] = language.value
 
         # 执行转录
+        print(f"🔄 transcribing: {str(audio_path)} ...")
         result = model.transcribe(str(audio_path), **options)
+        print(f"🔄 transcribed: {str(audio_path)} ...")
 
         # 转换为领域对象
         segments = tuple(
@@ -75,11 +76,6 @@ class WhisperASRAdapter:
         )
 
         detected_language = LanguageCode(result["language"])
-
-        # 模仿原项目的清理逻辑
-        # del model
-        # if torch.cuda.is_available():
-        #     torch.cuda.empty_cache()
 
         return segments, detected_language
 

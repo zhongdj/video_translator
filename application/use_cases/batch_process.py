@@ -523,57 +523,8 @@ def stage1_batch_asr(
     if progress:
         progress(0.0, "阶段1: 批量语音识别和翻译")
 
-    results = []
     total = len(videos)
 
-    # for idx, video in enumerate(videos):
-    #     if progress:
-    #         progress(idx / total, f"ASR: 处理视频 {idx + 1}/{total} - {video.path.name}")
-    #
-    #     cache_key = calculate_cache_key(
-    #         video.path,
-    #         "subtitles",
-    #         {"target_language": target_language.value, "source_language": "auto"}
-    #     )
-    #
-    #     cache_hit = cache_repo.exists(cache_key)
-    #
-    #     if cache_hit:
-    #         try:
-    #             cached = cache_repo.get(cache_key)
-    #             detected_lang = LanguageCode(cached["detected_language"])
-    #
-    #             original_subtitle, target_subtitle, secondary_subtitle = \
-    #                 _reconstruct_subtitles_from_cache(cached, detected_lang)
-    #
-    #             print(f"  💾 字幕缓存命中: {video.path.name}")
-    #
-    #         except (KeyError, ValueError) as e:
-    #             print(f"  ⚠️  字幕缓存损坏: {e}，重新生成")
-    #             cache_hit = False
-    #
-    #     if not cache_hit:
-    #         audio_path = video_processor.extract_audio(video)
-    #         original_segments, detected_lang = asr_provider.transcribe(audio_path)
-    #
-    #         original_subtitle = Subtitle(original_segments, detected_lang)
-    #         target_subtitle, secondary_subtitle = _translate_subtitles(
-    #             original_segments,
-    #             detected_lang,
-    #             translation_provider
-    #         )
-    #
-    #         cache_data = {
-    #             "detected_language": detected_lang.value,
-    #             "zh_segments": _serialize_segments(target_subtitle.segments),
-    #             "en_segments": _serialize_segments(secondary_subtitle.segments)
-    #         }
-    #
-    #         if detected_lang not in [LanguageCode.CHINESE, LanguageCode.ENGLISH]:
-    #             cache_data[f"{detected_lang.value}_segments"] = _serialize_segments(original_segments)
-    #
-    #         cache_repo.set(cache_key, cache_data)
-    #         print(f"  ✅ 完成: {video.path.name} ({detected_lang.value} -> zh, en)")
     videos_with_orig = phase1_extract_asr(list(videos), cache_repo, video_processor, asr_provider, progress)
     asr_provider.unload()
 

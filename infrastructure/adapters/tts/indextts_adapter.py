@@ -187,7 +187,42 @@ class IndexTTSAdapter(TTSProvider):
         if not self._is_loaded:
             self.load()
 
-        #调用批量接口（batch_size=1）
+        # 如果指定了 target_duration，先试合成一次估算时长
+        if target_duration is not None:
+            results = self.batch_synthesize(
+                texts=[text],
+                reference_audio_path=voice_profile.reference_audio_path,
+                language=voice_profile.language,
+                batch_size=8
+            )
+            audio = results[0]
+            actual_duration = len(audio.samples) / audio.sample_rate
+
+            # 如果超时，调整语速重新合成
+            if actual_duration > target_duration:
+                speed_factor = actual_duration / target_duration
+                adjusted_speed = min(self.speed * speed_factor, 2.0)  # 最大2倍速
+                print(
+                    f"  ⚡ 音频过长 ({actual_duration:.2f}s > {target_duration:.2f}s)，调整语速至 {adjusted_speed:.2f}x")
+
+                # 保存原始语速
+                original_speed = self.speed
+                self.speed = adjusted_speed
+
+                # 重新合成
+                results = self.batch_synthesize(
+                    texts=[text],
+                    reference_audio_path=voice_profile.reference_audio_path,
+                    language=voice_profile.language,
+                    batch_size=8
+                )
+
+                # 恢复原始语速
+                self.speed = original_speed
+
+            return results[0]
+
+        # 没有 target_duration，直接合成
         results = self.batch_synthesize(
             texts=[text],
             reference_audio_path=voice_profile.reference_audio_path,

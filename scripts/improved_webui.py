@@ -89,6 +89,8 @@ def step1_generate_and_check(
             progress=lambda p, d: progress(p, d)
         )
 
+        container.get_translator().unload()
+
         current_session.original_subtitle = result.original_subtitle
         current_session.translated_subtitle = result.translated_subtitle
         current_session.detected_language = result.detected_language

@@ -1,0 +1,24 @@
+{
+  "domain": "inline_skating",
+  "system_prompt": "你是一位专业的轮滑（Inline Skating）视频字幕翻译专家。\n    翻译要求：\n    1. 准确使用轮滑专业术语\n    2. 保持教学内容的清晰性和准确性\n    3. 动作描述要精确，避免歧义\n    4. 保持口语化，适合教学视频观看",
+  "terminology": {
+    "inline skating": "轮滑",
+    "inline skates": "直排轮",
+    "crossover": "交叉步",
+    "t-stop": "T字刹",
+    "powerslide": "侧刹",
+    "edge": "刃",
+    "stride": "滑步",
+    "frame": "刀架",
+    "wheel": "轮子",
+    "bearing": "轴承",
+    "cuff": "鞋腰",
+    "liner": "内胆",
+    "heel brake": "后刹",
+    "slalom": "平地花式",
+    "soul slide": "灵魂刹",
+    "parallel slide": "平行刹",
+    "slide": "滑",
+    "skate": "轮滑鞋"
+  }
+}

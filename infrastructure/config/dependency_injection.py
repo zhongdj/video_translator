@@ -1,8 +1,15 @@
+from pathlib import Path
+
+from domain.ports import TranslationProvider
+from domain.translation_context_repository import TranslationContextRepository
 from infrastructure.adapters.asr.FasterWhisperASRAdapter import FasterWhisperASRAdapter
 from infrastructure.adapters.asr.WhisperASRAdapter import WhisperASRAdapter
 from infrastructure.adapters.storage.FileCacheRepositoryAdapter import FileCacheRepositoryAdapter
+from infrastructure.adapters.storage.TranslationContextRepository import TranslationContextRepositoryAdapter
 from infrastructure.adapters.subtitle.PySRTSubtitleWriterAdapter import PySRTSubtitleWriterAdapter
 from infrastructure.adapters.translation.QwenTranslateAdapter import QwenTranslationAdapter
+from infrastructure.adapters.translation.enhanced_translation_adapter import EnhancedQwenTranslationAdapter, \
+    create_enhanced_translation_provider
 from infrastructure.adapters.tts.F5TTSAdapter import F5TTSAdapter
 from infrastructure.adapters.tts.indextts_adapter import IndexTTSAdapter
 from infrastructure.adapters.video.FFmpegVideoProcessorAdapter import FFmpegVideoProcessorAdapter
@@ -15,6 +22,7 @@ class DependencyContainer:
         self.cache_repo = FileCacheRepositoryAdapter()
         self.video_processor = FFmpegVideoProcessorAdapter()
         self.subtitle_writer = PySRTSubtitleWriterAdapter()
+        self.translator_context_repo = TranslationContextRepositoryAdapter(Path("./translation_contexts"))
 
         # 懒加载的模型
         self._asr = None
@@ -29,10 +37,16 @@ class DependencyContainer:
             self._asr = WhisperASRAdapter(model_size=model_size,device=device)
         return self._asr
 
-    def get_translator(self, model_name: str = "Qwen/Qwen2.5-7B") -> QwenTranslationAdapter:
-        """获取翻译提供者（懒加载）"""
+    # def get_translator(self, model_name: str = "Qwen/Qwen2.5-7B") -> QwenTranslationAdapter:
+    #     """获取翻译提供者（懒加载）"""
+    #     if self._translator is None:
+    #         self._translator = QwenTranslationAdapter(model_name=model_name)
+    #     return self._translator
+
+    def get_translator(self) -> TranslationProvider:
+        """获取增强的翻译提供者"""
         if self._translator is None:
-            self._translator = QwenTranslationAdapter(model_name=model_name)
+            self._translator = create_enhanced_translation_provider()
         return self._translator
 
     def get_tts(self) -> F5TTSAdapter:
@@ -49,6 +63,7 @@ class DependencyContainer:
             self._translator.unload()
         if self._tts:
             self._tts.unload()
+
 
 
 # 全局容器

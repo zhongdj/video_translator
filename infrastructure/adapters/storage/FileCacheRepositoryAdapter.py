@@ -34,3 +34,14 @@ class FileCacheRepositoryAdapter:
         """检查缓存是否存在"""
         cache_file = self.cache_dir / f"{key}.json"
         return cache_file.exists() and cache_file.stat().st_size > 0
+
+    def delete(self, key: str) -> bool:
+        """删除缓存"""
+        cache_file = self.cache_dir / f"{key}.json"
+        try:
+            if cache_file.exists():
+                cache_file.unlink()
+                return True
+            return False
+        except Exception:
+            return False

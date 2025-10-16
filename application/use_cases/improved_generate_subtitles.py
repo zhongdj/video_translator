@@ -57,7 +57,8 @@ def _translate_with_context(
     if context:
         _apply_translation_context(translation_provider, context)
 
-    return translation_provider.translate(segments, source_lang, target_lang)
+    result = translation_provider.translate(segments, source_lang, target_lang)
+    return result
 
 
 def _reconstruct_segments_from_cache(
@@ -145,6 +146,7 @@ def _translate_english_to_chinese(
         translation_provider,
         context
     )
+    translation_provider.unload()
     return en_segments, zh_segments
 
 
@@ -162,6 +164,7 @@ def _translate_chinese_to_english(
         translation_provider,
         context
     )
+    translation_provider.unload()
     return en_segments, zh_segments
 
 
@@ -192,7 +195,7 @@ def _translate_other_to_bilingual(
         translation_provider,
         context
     )
-
+    translation_provider.unload()
     if not zh_segments:
         raise ValueError(f"第二步翻译失败！en -> zh 返回空结果")
 
@@ -332,6 +335,7 @@ def improved_generate_subtitles_use_case(
     original_segments, detected_language = asr_provider.transcribe(
         audio_path, source_language
     )
+    asr_provider.unload()
 
     # 5. 执行翻译策略
     if progress:

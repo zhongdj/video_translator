@@ -200,7 +200,7 @@ class IndexTTSAdapter(TTSProvider):
 
             # 如果超时，调整语速重新合成
             if actual_duration > target_duration:
-                speed_factor = actual_duration / target_duration
+                speed_factor = actual_duration / (0.95 *target_duration)
                 adjusted_speed = min(self.speed * speed_factor, 2.0)  # 最大2倍速
                 print(
                     f"  ⚡ 音频过长 ({actual_duration:.2f}s > {target_duration:.2f}s)，调整语速至 {adjusted_speed:.2f}x")

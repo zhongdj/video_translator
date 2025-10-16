@@ -2,20 +2,15 @@
 Infrastructure Layer - 改进的WebUI(带翻译审核功能)
 完整版 - 包含全局替换和缓存同步
 """
-import tempfile
 from pathlib import Path
 from typing import Optional
 
 import gradio as gr
-import numpy as np
-import torch
-import torchaudio
 
 from domain.entities import Video, Subtitle, LanguageCode, TextSegment, TimeRange
 from domain.services import calculate_cache_key
 from domain.translation import TranslationContext
 from infrastructure.config.dependency_injection import container
-
 
 # 初始化翻译上下文仓储
 context_repo = container.translator_context_repo
@@ -31,6 +26,7 @@ class TranslationSession:
         self.translated_subtitle: Optional[Subtitle] = None
         self.english_subtitle: Optional[Subtitle] = None
         self.detected_language: Optional[LanguageCode] = None
+        self.source_language: Optional[LanguageCode] = None
         self.quality_report = None
         self.edited_segments = {}  # {index: edited_text}
         self.approved = False
@@ -98,17 +94,19 @@ def step1_generate_and_check(
         current_session.detected_language = result.detected_language
         current_session.quality_report = result.quality_report
         current_session.translation_context = translation_context
+        current_session.source_language = src_lang
 
         # 从缓存加载英文字幕
-        cache_key = calculate_cache_key(
-            current_session.video.path,
-            "subtitles_v2",
-            {
-                "target_language": LanguageCode.CHINESE.value,
-                "source_language": src_lang.value if src_lang else "auto",
-                "context_domain": translation_context.domain if translation_context else "general"
-            }
-        )
+        cache_params = {
+            "target_language": LanguageCode.CHINESE.value,
+            "source_language": src_lang
+        }
+
+        if translation_context:
+            cache_params["context_domain"] = translation_context.domain
+
+        print(f"improved_webui step1_generate_and_check: cache_params: {cache_params}")
+        cache_key = calculate_cache_key(current_session.video.path, "subtitles_v2", cache_params)
 
         try:
             cached = container.cache_repo.get(cache_key)
@@ -371,14 +369,18 @@ def _save_to_cache(operation_name: str = "操作"):
             print(f"⚠️ {operation_name}: 跳过缓存保存(缺少语言或上下文信息)")
             return
 
+        cache_params = {
+                "target_language": LanguageCode.CHINESE.value,
+                "source_language": current_session.source_language,
+                "context_domain": current_session.translation_context.domain
+            }
+
+        print(f"improved_webui _save_to_cache: cache_params: {cache_params}")
+
         cache_key = calculate_cache_key(
             current_session.video.path,
             "subtitles_v2",
-            {
-                "target_language": LanguageCode.CHINESE.value,
-                "source_language": current_session.detected_language.value,
-                "context_domain": current_session.translation_context.domain
-            }
+            cache_params
         )
 
         # 读取现有缓存(保留英文字幕和原始字幕)

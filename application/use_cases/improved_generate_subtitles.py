@@ -22,8 +22,8 @@ class ImprovedSubtitleGenerationResult:
 
 
 def _apply_translation_context(
-    translation_provider: TranslationProvider,
-    context
+        translation_provider: TranslationProvider,
+        context
 ):
     """
     应用翻译上下文到提供者
@@ -43,11 +43,11 @@ def _apply_translation_context(
 
 
 def _translate_with_context(
-    segments: tuple[TextSegment, ...],
-    source_lang: LanguageCode,
-    target_lang: LanguageCode,
-    translation_provider: TranslationProvider,
-    context: Optional[object]
+        segments: tuple[TextSegment, ...],
+        source_lang: LanguageCode,
+        target_lang: LanguageCode,
+        translation_provider: TranslationProvider,
+        context: Optional[object]
 ) -> tuple[TextSegment, ...]:
     """
     使用上下文进行翻译
@@ -62,8 +62,8 @@ def _translate_with_context(
 
 
 def _reconstruct_segments_from_cache(
-    cached_segments: list,
-    language: LanguageCode
+        cached_segments: list,
+        language: LanguageCode
 ) -> tuple[TextSegment, ...]:
     """从缓存重建文本片段"""
     return tuple(
@@ -89,8 +89,8 @@ def _serialize_segments(segments: tuple[TextSegment, ...]) -> list:
 
 
 def _load_subtitles_from_cache(
-    cache_repo: CacheRepository,
-    cache_key: str
+        cache_repo: CacheRepository,
+        cache_key: str
 ) -> Optional[ImprovedSubtitleGenerationResult]:
     """从缓存加载字幕"""
     if not cache_repo.exists(cache_key):
@@ -133,9 +133,9 @@ def _load_subtitles_from_cache(
 
 
 def _translate_english_to_chinese(
-    original_segments: tuple[TextSegment, ...],
-    translation_provider: TranslationProvider,
-    context: Optional[object]
+        original_segments: tuple[TextSegment, ...],
+        translation_provider: TranslationProvider,
+        context: Optional[object]
 ) -> tuple[tuple[TextSegment, ...], tuple[TextSegment, ...]]:
     """英文翻译策略：en -> zh"""
     en_segments = original_segments
@@ -151,9 +151,9 @@ def _translate_english_to_chinese(
 
 
 def _translate_chinese_to_english(
-    original_segments: tuple[TextSegment, ...],
-    translation_provider: TranslationProvider,
-    context: Optional[object]
+        original_segments: tuple[TextSegment, ...],
+        translation_provider: TranslationProvider,
+        context: Optional[object]
 ) -> tuple[tuple[TextSegment, ...], tuple[TextSegment, ...]]:
     """中文翻译策略：zh -> en"""
     zh_segments = original_segments
@@ -169,10 +169,10 @@ def _translate_chinese_to_english(
 
 
 def _translate_other_to_bilingual(
-    original_segments: tuple[TextSegment, ...],
-    detected_language: LanguageCode,
-    translation_provider: TranslationProvider,
-    context: Optional[object]
+        original_segments: tuple[TextSegment, ...],
+        detected_language: LanguageCode,
+        translation_provider: TranslationProvider,
+        context: Optional[object]
 ) -> tuple[tuple[TextSegment, ...], tuple[TextSegment, ...]]:
     """其他语言翻译策略：other -> en -> zh"""
     # 第一步：original -> en
@@ -203,11 +203,11 @@ def _translate_other_to_bilingual(
 
 
 def _execute_translation_strategy(
-    original_segments: tuple[TextSegment, ...],
-    detected_language: LanguageCode,
-    translation_provider: TranslationProvider,
-    context: Optional[object],
-    progress: Optional[Callable[[float, str], None]]
+        original_segments: tuple[TextSegment, ...],
+        detected_language: LanguageCode,
+        translation_provider: TranslationProvider,
+        context: Optional[object],
+        progress: Optional[Callable[[float, str], None]]
 ) -> tuple[tuple[TextSegment, ...], tuple[TextSegment, ...]]:
     """
     执行翻译策略（策略模式）
@@ -237,9 +237,9 @@ def _execute_translation_strategy(
 
 
 def _validate_translation_results(
-    en_segments: tuple,
-    zh_segments: tuple,
-    detected_language: LanguageCode
+        en_segments: tuple,
+        zh_segments: tuple,
+        detected_language: LanguageCode
 ):
     """验证翻译结果"""
     if not en_segments:
@@ -249,13 +249,15 @@ def _validate_translation_results(
 
 
 def _build_cache_data(
-    detected_language: LanguageCode,
-    original_segments: tuple[TextSegment, ...],
-    en_segments: tuple[TextSegment, ...],
-    zh_segments: tuple[TextSegment, ...]
+        source_language: Optional[LanguageCode],
+        detected_language: LanguageCode,
+        original_segments: tuple[TextSegment, ...],
+        en_segments: tuple[TextSegment, ...],
+        zh_segments: tuple[TextSegment, ...]
 ) -> dict:
     """构建缓存数据"""
     cache_data = {
+        "source_language": source_language,
         "detected_language": detected_language.value,
         "zh_segments": _serialize_segments(zh_segments),
         "en_segments": _serialize_segments(en_segments)
@@ -269,16 +271,16 @@ def _build_cache_data(
 
 
 def improved_generate_subtitles_use_case(
-    video: Video,
-    asr_provider: ASRProvider,
-    translation_provider: TranslationProvider,
-    video_processor: VideoProcessor,
-    cache_repo: CacheRepository,
-    translation_context: Optional[object] = None,
-    target_language: LanguageCode = LanguageCode.CHINESE,
-    source_language: Optional[LanguageCode] = None,
-    enable_quality_check: bool = True,
-    progress: Optional[Callable[[float, str], None]] = None
+        video: Video,
+        asr_provider: ASRProvider,
+        translation_provider: TranslationProvider,
+        video_processor: VideoProcessor,
+        cache_repo: CacheRepository,
+        translation_context: Optional[object] = None,
+        target_language: LanguageCode = LanguageCode.CHINESE,
+        source_language: Optional[LanguageCode] = None,
+        enable_quality_check: bool = True,
+        progress: Optional[Callable[[float, str], None]] = None
 ) -> ImprovedSubtitleGenerationResult:
     """
     改进的字幕生成用例（纯函数）
@@ -309,14 +311,13 @@ def improved_generate_subtitles_use_case(
     # 1. 计算缓存键（包含上下文信息）
     cache_params = {
         "target_language": target_language.value,
-        "source_language": source_language.value if source_language else "auto"
+        "source_language": source_language
     }
 
     if translation_context:
         cache_params["context_domain"] = translation_context.domain
 
     cache_key = calculate_cache_key(video.path, "subtitles_v2", cache_params)
-
     # 2. 尝试从缓存加载
     cached_result = _load_subtitles_from_cache(cache_repo, cache_key)
     if cached_result:
@@ -377,9 +378,9 @@ def improved_generate_subtitles_use_case(
         )
 
     # 8. 保存缓存
-    cache_data = _build_cache_data(
-        detected_language, original_segments, en_segments, zh_segments
-    )
+    cache_data = _build_cache_data(source_language,
+                                   detected_language, original_segments, en_segments, zh_segments
+                                   )
     cache_repo.set(cache_key, cache_data)
 
     if progress:

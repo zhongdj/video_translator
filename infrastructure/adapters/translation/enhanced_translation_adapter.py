@@ -23,7 +23,7 @@ class EnhancedQwenTranslationAdapter(TranslationProvider):
         self.system_prompt: Optional[str] = None
         self.terminology: dict[str, str] = {}
 
-        self._load_model()
+
 
     def _load_model(self):
         """加载模型"""
@@ -113,6 +113,9 @@ class EnhancedQwenTranslationAdapter(TranslationProvider):
             return_tensors="pt",
             padding=True
         ).to(self.device)
+
+        if self.model is None:
+            self._load_model()
 
         with torch.no_grad():
             outputs = self.model.generate(

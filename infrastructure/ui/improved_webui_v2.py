@@ -393,7 +393,7 @@ def step2_incremental_voice_cloning(
             progress=segment_progress
         )
 
-        container.get_tts().unload()
+        #container.get_tts().unload()
 
         # 🔧 关键修复4: 更新所有音频片段到会话
         for audio_seg in result.audio_segments:
@@ -514,7 +514,7 @@ def step2_regenerate_modified():
             progress=None
         )
 
-        container.get_tts().unload()
+        #container.get_tts().unload()
 
         # 更新音频片段
         for audio_seg in result.audio_segments:
@@ -763,7 +763,7 @@ def get_video_duration(video_path: Path) -> float:
 def step3_final_synthesis(progress=gr.Progress()):
     """步骤3: 最终视频合成"""
     global current_session
-
+    container.get_tts().unload()
     if not current_session.video:
         return None, None, None, "❌ 错误: 会话状态丢失"
 

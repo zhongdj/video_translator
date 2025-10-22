@@ -179,3 +179,85 @@ class FileStorage(Protocol):
     def exists(self, path: Path) -> bool:
         """检查文件是否存在"""
         ...
+
+
+"""
+Domain Layer - 音频片段仓储接口
+"""
+from abc import ABC, abstractmethod
+from pathlib import Path
+from typing import Protocol, Optional, List
+from domain.entities import AudioSegment, TextSegment
+
+
+class AudioSegmentRepository(Protocol):
+    """音频片段仓储接口"""
+
+    def save_segment(
+            self,
+            segment_index: int,
+            audio_segment: AudioSegment,
+            video_path: Path
+    ) -> Path:
+        """
+        保存音频片段到磁盘
+
+        Args:
+            segment_index: 片段索引
+            audio_segment: 音频片段实体
+            video_path: 关联的视频路径（用于生成缓存键）
+
+        Returns:
+            保存的文件路径
+        """
+        ...
+
+    def load_segment(
+            self,
+            segment_index: int,
+            video_path: Path,
+            text_segment: TextSegment
+    ) -> Optional[AudioSegment]:
+        """
+        加载音频片段
+
+        Args:
+            segment_index: 片段索引
+            video_path: 关联的视频路径
+            text_segment: 对应的文本片段（用于验证）
+
+        Returns:
+            音频片段实体，不存在则返回 None
+        """
+        ...
+
+    def exists(
+            self,
+            segment_index: int,
+            video_path: Path
+    ) -> bool:
+        """检查音频片段是否存在"""
+        ...
+
+    def delete_segment(
+            self,
+            segment_index: int,
+            video_path: Path
+    ) -> bool:
+        """删除音频片段"""
+        ...
+
+    def list_segments(
+            self,
+            video_path: Path
+    ) -> List[int]:
+        """列出所有已缓存的片段索引"""
+        ...
+
+    def get_segment_path(
+            self,
+            segment_index: int,
+            video_path: Path
+    ) -> Path:
+        """获取片段的存储路径（用于前端播放）"""
+        ...

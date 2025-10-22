@@ -1,6 +1,6 @@
 """
-Infrastructure Layer - 增强 WebUI V2
-支持分段语音克隆、实时预览和增量合成
+Infrastructure Layer - 增强 WebUI V2 (修复版)
+修复音频片段缓存和预览问题
 """
 from pathlib import Path
 from typing import Optional, Dict
@@ -22,8 +22,6 @@ from infrastructure.adapters.storage.audio_segment_repository_adapter import Aud
 from infrastructure.config.dependency_injection import container
 
 # 初始化音频片段仓储
-
-
 audio_segment_repo = AudioSegmentRepositoryAdapter()
 
 
@@ -41,12 +39,12 @@ class TranslationSessionV2:
         self.source_language: Optional[LanguageCode] = None
         self.quality_report = None
 
-        # 新增：音频片段管理
+        # 新增:音频片段管理
         self.audio_segments: Dict[int, AudioSegment] = {}
         self.segment_review_status: Dict[int, SegmentReviewStatus] = {}
 
         # 修改追踪
-        self.edited_segments: Dict[int, str] = {}  # {index: edited_text}
+        self.edited_segments: Dict[int, str] = {}
         self.modified_indices: set[int] = set()
 
         # 参考音频
@@ -57,6 +55,44 @@ class TranslationSessionV2:
 
 # 全局会话对象
 current_session = TranslationSessionV2()
+
+
+# ============== 🔧 修复函数:加载已缓存的音频片段 ============== #
+def _load_cached_audio_segments(video: Video, subtitle: Subtitle) -> Dict[int, AudioSegment]:
+    """
+    从磁盘加载已缓存的音频片段
+
+    Returns:
+        {segment_index: AudioSegment}
+    """
+    cached_segments = {}
+
+    print(f"\n🔍 检查音频片段缓存:")
+    print(f"   视频: {video.path.name}")
+    print(f"   片段总数: {len(subtitle.segments)}")
+
+    for idx, text_seg in enumerate(subtitle.segments):
+        try:
+            # 尝试从仓储加载
+            audio_seg = audio_segment_repo.load_segment(
+                segment_index=idx,
+                video_path=video.path,
+                text_segment=text_seg
+            )
+
+            if audio_seg:
+                cached_segments[idx] = audio_seg
+                # print(f"   ✅ 片段 {idx} 已加载")
+            # else:
+            #     print(f"   ⚠️  片段 {idx} 未缓存")
+
+        except Exception as e:
+            print(f"   ❌ 片段 {idx} 加载失败: {e}")
+            continue
+
+    print(f"✅ 共加载 {len(cached_segments)}/{len(subtitle.segments)} 个缓存片段\n")
+
+    return cached_segments
 
 
 # ============== 步骤1: 生成字幕和质量检查 ============== #
@@ -124,10 +160,12 @@ def step1_generate_and_check_v2(
         current_session.translation_context = translation_context
         current_session.source_language = src_lang
 
+        src_lang = LanguageCode(current_session.source_language.value) if current_session.source_language and current_session.source_language.value != "auto" else None
+
         # 从缓存加载英文字幕
         cache_params = {
             "target_language": LanguageCode.CHINESE.value,
-            "source_language": src_lang.value if src_lang else "auto"
+            "source_language": src_lang
         }
 
         if translation_context:
@@ -154,17 +192,44 @@ def step1_generate_and_check_v2(
         except Exception as e:
             print(f"  ⚠️  加载英文字幕失败: {e}")
 
+        # 🔧 关键修复1: 加载已缓存的音频片段
+        progress(0.95, "检查音频缓存...")
+        current_session.audio_segments = _load_cached_audio_segments(
+            current_session.video,
+            current_session.translated_subtitle
+        )
+
+        # 🔧 关键修复1.5: 如果有缓存音频，尝试恢复参考音频路径
+        if current_session.audio_segments:
+            # 尝试从视频中提取参考音频（为后续编辑做准备）
+            try:
+                temp_ref_audio = container.video_processor.extract_reference_audio(
+                    current_session.video,
+                    duration=10.0
+                )
+                current_session.reference_audio_path = temp_ref_audio
+                print(f"  ✅ 已准备参考音频: {temp_ref_audio}")
+            except Exception as e:
+                print(f"  ⚠️  准备参考音频失败: {e}")
+                print(f"  💡 提示: 如需修改字幕，请先执行步骤2A获取参考音频")
+
         # 初始化审核状态
         for idx in range(len(result.translated_subtitle.segments)):
+            # 检查音频是否已缓存
+            audio_exists = idx in current_session.audio_segments
+
             current_session.segment_review_status[idx] = SegmentReviewStatus(
                 segment_index=idx,
                 subtitle_approved=False,
-                audio_approved=False,
+                audio_approved=audio_exists,  # 如果音频已缓存则标记为已完成
                 subtitle_modified=False,
-                needs_regeneration=True
+                needs_regeneration=not audio_exists  # 如果音频不存在则需要生成
             )
 
         # 生成状态报告
+        cached_audio_count = len(current_session.audio_segments)
+        total_segments = len(result.translated_subtitle.segments)
+
         report_lines = [
             f"✅ 字幕生成完成",
             f"",
@@ -172,8 +237,12 @@ def step1_generate_and_check_v2(
             f"   视频: {current_session.video.path.name}",
             f"   时长: {current_session.video.duration:.1f} 秒",
             f"   检测语言: {result.detected_language.value}",
-            f"   总片段数: {len(result.translated_subtitle.segments)}",
+            f"   总片段数: {total_segments}",
             f"   使用上下文: {translation_context.domain}",
+            f"",
+            f"🎵 音频缓存状态:",
+            f"   已缓存片段: {cached_audio_count}/{total_segments}",
+            f"   需要生成: {total_segments - cached_audio_count}",
         ]
 
         # 质量报告
@@ -189,7 +258,7 @@ def step1_generate_and_check_v2(
 
         status_report = "\n".join(report_lines)
 
-        # 准备审核数据（不包含音频）
+        # 准备审核数据(不包含音频)
         review_data = _prepare_review_data_v2()
 
         return review_data, status_report, gr.update(visible=True)
@@ -201,7 +270,7 @@ def step1_generate_and_check_v2(
 
 
 def _prepare_review_data_v2():
-    """准备审核数据（包含音频播放器）"""
+    """准备审核数据(包含音频播放器)"""
     global current_session
 
     if not current_session.translated_subtitle:
@@ -234,7 +303,7 @@ def _prepare_review_data_v2():
                     for i in segment_issues
                 ])
 
-        # 音频状态
+        # 🔧 关键修复2: 正确显示音频状态
         audio_status = "未生成"
         if idx in current_session.audio_segments:
             audio_status = "✅ 已缓存"
@@ -269,7 +338,7 @@ def step2_incremental_voice_cloning(
         reference_audio_file,
         progress=gr.Progress()
 ):
-    """步骤2: 增量语音克隆（逐片段合成）"""
+    """步骤2: 增量语音克隆(逐片段合成)"""
     global current_session
 
     if not current_session.video or not current_session.translated_subtitle:
@@ -290,14 +359,14 @@ def step2_incremental_voice_cloning(
             )
             current_session.reference_audio_path = ref_audio_path
 
-        # 实时进度回调（更新表格）
+        # 实时进度回调(更新表格)
         synthesis_log = []
 
         def segment_progress(ratio, msg, idx, audio_seg):
             synthesis_log.append(f"[{ratio * 100:.0f}%] {msg}")
             progress(ratio, msg)
 
-            # 如果有音频片段，更新会话状态
+            # 🔧 关键修复3: 如果有音频片段,更新会话状态
             if audio_seg:
                 current_session.audio_segments[idx] = audio_seg
 
@@ -307,7 +376,7 @@ def step2_incremental_voice_cloning(
                     current_session.segment_review_status[idx] = SegmentReviewStatus(
                         segment_index=idx,
                         subtitle_approved=False,
-                        audio_approved=False,
+                        audio_approved=True,  # 标记音频已完成
                         subtitle_modified=False,
                         needs_regeneration=False
                     )
@@ -326,7 +395,7 @@ def step2_incremental_voice_cloning(
 
         container.get_tts().unload()
 
-        # 更新所有音频片段
+        # 🔧 关键修复4: 更新所有音频片段到会话
         for audio_seg in result.audio_segments:
             current_session.audio_segments[audio_seg.segment_index] = audio_seg
 
@@ -421,8 +490,17 @@ def step2_regenerate_modified():
     if not current_session.modified_indices:
         return "ℹ️ 没有需要重新生成的片段", gr.update()
 
+    # 🔧 关键修复: 检查参考音频
+    if not current_session.reference_audio_path:
+        return "❌ 错误: 缺少参考音频。请先完成步骤2A(增量语音克隆)", gr.update()
+
+    if not current_session.reference_audio_path.exists():
+        return f"❌ 错误: 参考音频文件不存在: {current_session.reference_audio_path}", gr.update()
+
     try:
-        print(f"  🔄 重新生成 {len(current_session.modified_indices)} 个片段")
+        print(f"\n🔄 重新生成修改片段:")
+        print(f"   修改片段数: {len(current_session.modified_indices)}")
+        print(f"   参考音频: {current_session.reference_audio_path}")
 
         result = regenerate_modified_segments_use_case(
             video=current_session.video,
@@ -432,7 +510,7 @@ def step2_regenerate_modified():
             tts_provider=container.get_tts(),
             video_processor=container.video_processor,
             audio_repo=audio_segment_repo,
-            reference_audio_path=current_session.reference_audio_path,
+            reference_audio_path=current_session.reference_audio_path,  # 🔧 确保传递
             progress=None
         )
 
@@ -449,7 +527,7 @@ def step2_regenerate_modified():
                 current_session.segment_review_status[idx] = SegmentReviewStatus(
                     segment_index=idx,
                     subtitle_approved=False,
-                    audio_approved=False,
+                    audio_approved=True,  # 音频已重新生成
                     subtitle_modified=True,
                     needs_regeneration=False
                 )
@@ -470,29 +548,123 @@ def step2_regenerate_modified():
         return f"❌ 重新生成失败: {str(e)}\n{traceback.format_exc()}", gr.update()
 
 
-# ============== 片段预览功能 ============== #
-def preview_segment(selected_row_index):
-    """预览选中的片段"""
+# ============== 🔧 修复函数: 片段预览功能 ============== #
+def preview_segment(evt: gr.SelectData):
+    """
+    预览选中的片段
+
+    Args:
+        evt: Gradio SelectData 事件,包含选中行的信息
+    """
     global current_session
 
-    if selected_row_index is None or selected_row_index < 0:
-        return None, "请选择一个片段", "", ""
+    # 🐛 调试信息
+    print(f"\n🔍 预览片段调试信息:")
+    print(f"   事件对象: {evt}")
+    print(f"   事件类型: {type(evt)}")
+    if evt:
+        print(f"   evt.index: {evt.index}")
+        print(f"   evt.value: {getattr(evt, 'value', 'N/A')}")
 
-    if selected_row_index >= len(current_session.translated_subtitle.segments):
-        return None, "无效的片段索引", "", ""
+    # 🔧 防御性检查1: 检查事件对象
+    if evt is None:
+        print(f"   ❌ 事件对象为 None")
+        return None, "⚠️ 事件数据为空", "", ""
+
+    # 🔧 防御性检查2: 检查会话状态
+    if not current_session.video:
+        print(f"   ❌ 会话状态丢失")
+        return None, "❌ 会话状态丢失,请重新从步骤1开始", "", ""
+
+    if not current_session.translated_subtitle:
+        print(f"   ❌ 没有字幕数据")
+        return None, "❌ 没有字幕数据", "", ""
+
+    # 🔧 防御性检查3: 检查索引
+    try:
+        if evt.index is None:
+            print(f"   ❌ evt.index 为 None")
+            return None, "⚠️ 未选中任何行", "", ""
+
+        # 🔧 关键修复: evt.index 可能是元组、列表或整数
+        if isinstance(evt.index, (tuple, list)):
+            # [row, col] 或 (row, col) 格式
+            selected_row_index = evt.index[0]
+            print(f"   ✅ 解析序列索引: {evt.index} -> 行 {selected_row_index}")
+        elif isinstance(evt.index, (int, float)):
+            # 直接是数字
+            selected_row_index = evt.index
+            print(f"   ✅ 直接使用索引: {selected_row_index}")
+        else:
+            # 未知格式
+            print(f"   ❌ 未知的索引格式: {type(evt.index)}")
+            return None, f"❌ 未知的索引格式: {type(evt.index)}", "", ""
+
+        # 转换为整数
+        selected_row_index = int(selected_row_index)
+        print(f"   ✅ 最终行索引: {selected_row_index}")
+
+    except (TypeError, ValueError, IndexError) as e:
+        print(f"   ❌ 索引解析失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, f"❌ 索引解析失败: {e}", "", ""
+
+    # 🔧 防御性检查4: 验证索引范围
+    total_segments = len(current_session.translated_subtitle.segments)
+    print(f"   总片段数: {total_segments}")
+
+    if selected_row_index < 0 or selected_row_index >= total_segments:
+        print(f"   ❌ 索引超出范围: {selected_row_index}")
+        return None, f"❌ 无效的片段索引: {selected_row_index} (总数: {total_segments})", "", ""
 
     idx = selected_row_index
-    text_seg = current_session.translated_subtitle.segments[idx]
 
-    # 获取音频
+    try:
+        text_seg = current_session.translated_subtitle.segments[idx]
+        print(f"   ✅ 获取片段 {idx}: {text_seg.text[:30]}...")
+    except IndexError:
+        print(f"   ❌ 无法获取片段 {idx}")
+        return None, f"❌ 无法获取片段 {idx}", "", ""
+
+    # 🔧 关键修复5: 从会话或磁盘获取音频
     audio_seg = current_session.audio_segments.get(idx)
+    print(f"   内存中音频: {audio_seg is not None}")
 
+    # 如果内存中没有,尝试从磁盘加载
+    if not audio_seg:
+        print(f"   尝试从磁盘加载...")
+        try:
+            audio_seg = audio_segment_repo.load_segment(
+                segment_index=idx,
+                video_path=current_session.video.path,
+                text_segment=text_seg
+            )
+
+            # 如果加载成功,更新到会话
+            if audio_seg:
+                current_session.audio_segments[idx] = audio_seg
+                print(f"   ✅ 片段 {idx} 从磁盘加载成功")
+            else:
+                print(f"   ⚠️  磁盘也没有片段 {idx}")
+        except Exception as e:
+            print(f"   ❌ 片段 {idx} 加载失败: {e}")
+
+    # 检查音频文件
     if audio_seg and audio_seg.file_path:
-        audio_path = str(audio_seg.file_path)
-        audio_status = "✅ 音频已生成"
+        print(f"   音频文件路径: {audio_seg.file_path}")
+        if audio_seg.file_path.exists():
+            audio_path = str(audio_seg.file_path)
+            audio_status = "✅ 音频已生成"
+            print(f"   ✅ 音频文件存在")
+        else:
+            audio_path = None
+            audio_status = f"❌ 音频文件不存在: {audio_seg.file_path.name}"
+            print(f"   ❌ 音频文件不存在")
     else:
         audio_path = None
         audio_status = "⚠️  音频未生成"
+        print(f"   ⚠️  没有音频片段")
 
     # 文本信息
     text_info = f"""
@@ -502,6 +674,8 @@ def preview_segment(selected_row_index):
 """
 
     subtitle_text = text_seg.text
+
+    print(f"   返回结果: audio={audio_path is not None}, status={audio_status}\n")
 
     return audio_path, audio_status, text_info, subtitle_text
 
@@ -539,10 +713,10 @@ def _save_to_cache_v2(operation_name: str = "操作"):
     try:
         if not current_session.video or not current_session.translated_subtitle:
             return
-
+        src_lang = LanguageCode(current_session.source_language.value) if current_session.source_language and current_session.source_language.value != "auto" else None
         cache_params = {
             "target_language": LanguageCode.CHINESE.value,
-            "source_language": current_session.source_language.value if current_session.source_language else "auto",
+            "source_language": src_lang,
         }
 
         if current_session.translation_context:
@@ -593,14 +767,23 @@ def step3_final_synthesis(progress=gr.Progress()):
     if not current_session.video:
         return None, None, None, "❌ 错误: 会话状态丢失"
 
+    # 🔧 关键修复6: 重新检查音频状态
+    total_segments = len(current_session.translated_subtitle.segments)
+    audio_ready = len(current_session.audio_segments)
+
+    print(f"\n🔍 最终合成前检查:")
+    print(f"   总片段数: {total_segments}")
+    print(f"   音频已生成: {audio_ready}")
+    print(f"   缺失片段: {total_segments - audio_ready}")
+
     # 检查是否所有片段都已审核
     unreviewed = [
-        idx for idx, status in current_session.segment_review_status.items()
-        if not status.audio_approved
+        idx for idx in range(total_segments)
+        if idx not in current_session.audio_segments
     ]
 
-    if unreviewed and len(unreviewed) > len(current_session.segment_review_status) * 0.3:
-        return None, None, None, f"⚠️  还有 {len(unreviewed)} 个片段未完成音频生成"
+    if unreviewed and len(unreviewed) > total_segments * 0.3:
+        return None, None, None, f"⚠️  还有 {len(unreviewed)} 个片段未完成音频生成,请先完成步骤2"
 
     try:
         progress(0.1, "准备合成...")
@@ -718,14 +901,20 @@ def build_ui_v2():
         """
     ) as demo:
         gr.Markdown("""
-        # 🎬 视频翻译工厂 Pro V2 - 分段审核版
+        # 🎬 视频翻译工厂 Pro V2 - 分段审核版 (修复版)
 
         ## ✨ V2 新特性
         - 🎵 **分段语音克隆**: 逐片段生成并缓存音频
-        - 👂 **实时预览**: 边生成边试听，即时反馈
+        - 👂 **实时预览**: 边生成边试听,即时反馈
         - ✏️  **精细编辑**: 修改字幕后仅重新生成对应片段
-        - 💾 **智能缓存**: 片段级缓存，断点续传
-        - 🔄 **增量合成**: 跳过未修改的片段，提升效率
+        - 💾 **智能缓存**: 片段级缓存,断点续传
+        - 🔄 **增量合成**: 跳过未修改的片段,提升效率
+
+        ## 🔧 本次修复
+        - ✅ 修复音频片段预览无法播放问题
+        - ✅ 修复缓存加载逻辑,步骤1后自动加载已缓存音频
+        - ✅ 修复最终合成时音频状态检查
+        - ✅ 优化会话状态管理,确保数据一致性
 
         ## 📋 优化工作流程
         1. **生成字幕** → 2A. **增量语音克隆** → 2B. **审核修改** → 2C. **重新生成** → 3. **最终合成**
@@ -778,7 +967,7 @@ def build_ui_v2():
                 gr.Markdown("""
                 ### 工作流程
                 1. **2A. 增量语音克隆**: 逐片段生成音频并缓存
-                2. **2B. 审核预览**: 试听音频，修改字幕
+                2. **2B. 审核预览**: 试听音频,修改字幕
                 3. **2C. 重新生成**: 只重新生成修改过的片段
                 """)
 
@@ -787,7 +976,7 @@ def build_ui_v2():
                     gr.Markdown("### 2A. 增量语音克隆")
 
                     reference_audio = gr.File(
-                        label="🎵 参考音频（可选）",
+                        label="🎵 参考音频(可选)",
                         file_types=[".wav", ".mp3"]
                     )
 
@@ -805,7 +994,7 @@ def build_ui_v2():
                         row_count=(10, "dynamic"),
                         interactive=True,
                         wrap=True,
-                        label="字幕审核表格"
+                        label="字幕审核表格 (点击行预览音频)"
                     )
 
                     with gr.Row():
@@ -816,7 +1005,7 @@ def build_ui_v2():
 
                 # 片段预览区
                 with gr.Group():
-                    gr.Markdown("### 👂 片段预览（点击表格行预览）")
+                    gr.Markdown("### 👂 片段预览 (点击表格行预览)")
 
                     with gr.Row():
                         with gr.Column(scale=1):
@@ -890,12 +1079,27 @@ def build_ui_v2():
                 outputs=[edit_status, review_dataframe]
             )
 
-            # 表格选择事件 - 预览片段
-            review_dataframe.select(
-                preview_segment,
-                inputs=[],  # Gradio 会自动传入选中的行索引
-                outputs=[preview_audio, preview_status, preview_info, preview_text]
-            )
+            # 🔧 修复: 表格选择事件 - 使用 SelectData + 错误处理
+            try:
+                review_dataframe.select(
+                    preview_segment,
+                    outputs=[preview_audio, preview_status, preview_info, preview_text]
+                )
+            except Exception as e:
+                print(f"⚠️ 表格选择事件绑定失败: {e}")
+                # 如果绑定失败,添加一个替代方案
+                gr.Markdown("""
+                ⚠️ **片段预览功能初始化失败**
+                
+                可能原因:
+                - Gradio 版本不兼容
+                - 表格数据格式问题
+                
+                解决方案:
+                1. 确保 Gradio >= 4.0
+                2. 检查表格是否有数据
+                3. 查看控制台错误日志
+                """)
 
             # 步骤3: 最终合成
             final_btn.click(
@@ -904,193 +1108,255 @@ def build_ui_v2():
             )
 
         # ========== 使用说明 ========== #
-        with gr.Tab("📚 V2 使用指南"):
+        with gr.Tab("📚 V2 使用指南 + 修复说明"):
             gr.Markdown("""
-            ## 🎯 V2 核心改进
-
-            ### 问题背景
-            传统流程的痛点：
-            1. **全量合成耗时长**: 所有片段必须全部生成完才能审核
-            2. **修改成本高**: 发现问题后需要重新生成整个视频
-            3. **无法预览**: 听不到音频效果，只能盲审字幕
-            4. **缓存粒度粗**: 只能全有或全无，无法部分复用
-
-            ### V2 解决方案
-
-            #### 1. 分段生成架构
-            ```
-            传统流程:
-            字幕生成 → [等待] → 全量语音合成 → [等待] → 审核 → [发现问题] → 重新全量合成
-
-            V2 流程:
-            字幕生成 → 片段1合成 → [立即预览] → 片段2合成 → [立即预览] → ...
-            → 发现问题 → 修改字幕 → [只重新生成该片段] → 完成
-            ```
-
-            #### 2. 增量缓存机制
-            ```
-            .cache/audio_segments/
-            ├── video_abc123/
-            │   ├── seg_0000.wav      # 片段0音频
-            │   ├── seg_0000.json     # 片段0元数据
-            │   ├── seg_0001.wav
-            │   ├── seg_0001.json
-            │   └── ...
-            ```
-
-            每个片段独立缓存，修改某个字幕后：
-            - ✅ 只删除对应片段的缓存
-            - ✅ 只重新生成该片段
-            - ✅ 其他片段直接复用
-
-            #### 3. 实时反馈循环
+            ## 🔧 本次修复内容
+            
+            ### 修复的问题
+            1. ❌ **片段预览无法播放**: 点击表格行后音频无法加载
+            2. ❌ **音频状态不准确**: 明明已缓存但显示"未生成"
+            3. ❌ **最终合成失败**: 提示音频未生成,无法合成视频
+            4. ❌ **会话状态丢失**: 刷新后音频缓存信息丢失
+            
+            ### 根本原因
             ```python
-            def synthesis_progress(ratio, msg, segment_index, audio_segment):
-                # 每完成一个片段就回调
-                if audio_segment:
-                    # 立即更新UI
-                    # 立即可以预览
-                    # 立即保存缓存
-            ```
-
-            #### 4. 审核状态管理
-            ```python
-            SegmentReviewStatus:
-                - subtitle_approved: 字幕是否审核通过
-                - audio_approved: 音频是否审核通过
-                - subtitle_modified: 是否被修改
-                - needs_regeneration: 是否需要重新生成
-            ```
-
-            ### 使用最佳实践
-
-            #### 快速试错流程
-            1. 上传视频，生成字幕（步骤1）
-            2. 开始增量语音克隆（步骤2A）
-            3. **边生成边预览**: 生成几个片段后就可以开始试听
-            4. **发现问题立即修改**: 不用等全部完成
-            5. **只重新生成修改的片段**（步骤2C）
-            6. 最终合成（步骤3）
-
-            #### 大批量处理
-            1. 先完整生成第一个视频
-            2. 检查音质和翻译质量
-            3. 调整参数和上下文
-            4. 后续视频可以复用参考音频
-            5. 利用缓存快速迭代
-
-            ### 性能对比
-
-            | 场景 | 传统流程 | V2 流程 | 提升 |
-            |------|---------|---------|------|
-            | 首次生成 | 10分钟 | 10分钟 | 0% |
-            | 修改1个片段 | 10分钟 | 10秒 | **60x** ⭐ |
-            | 修改5个片段 | 10分钟 | 50秒 | **12x** |
-            | 断点续传 | 从头开始 | 继续生成 | **∞** |
-            | 预览时机 | 全部完成后 | 边生成边预览 | **实时** |
-
-            ### 技术架构
-
-            #### 领域层新实体
-            ```python
-            @dataclass(frozen=True)
-            class AudioSegment:
-                segment_index: int
-                audio: AudioSample
-                text_segment: TextSegment
-                cache_key: str
-                file_path: Optional[Path]
-            ```
-
-            #### 仓储接口
-            ```python
-            class AudioSegmentRepository(Protocol):
-                def save_segment(idx, audio_seg, video_path) -> Path
-                def load_segment(idx, video_path, text_seg) -> AudioSegment
-                def exists(idx, video_path) -> bool
-                def delete_segment(idx, video_path) -> bool
-            ```
-
-            #### 应用层用例
-            ```python
-            incremental_voice_cloning_use_case(
-                video, subtitle, tts_provider,
-                audio_repo,  # 新增：片段仓储
-                progress=lambda ratio, msg, idx, audio_seg: ...
-                # 回调携带音频片段，实时更新UI
+            # 问题1: 音频片段未加载到会话
+            # 步骤1完成后,虽然磁盘有缓存,但 current_session.audio_segments 为空
+            
+            # 问题2: 预览功能只从内存读取
+            audio_seg = current_session.audio_segments.get(idx)
+            # 如果内存没有,直接返回 None,不尝试从磁盘加载
+            
+            # 问题3: Gradio 事件绑定错误
+            review_dataframe.select(
+                preview_segment,
+                inputs=[],  # ❌ 空输入,无法获取选中行
+                outputs=[...]
             )
             ```
-
-            ### 缓存一致性保证
-
-            #### 缓存键生成
+            
+            ### 修复方案
+            
+            #### 1. 步骤1后自动加载缓存音频
             ```python
-            cache_key = md5(f"{video_name}_{segment_index}_{text_content}")
+            # 新增函数: _load_cached_audio_segments()
+            def step1_generate_and_check_v2(...):
+                # ... 生成字幕 ...
+                
+                # 🔧 关键修复: 加载已缓存的音频片段
+                progress(0.95, "检查音频缓存...")
+                current_session.audio_segments = _load_cached_audio_segments(
+                    current_session.video,
+                    current_session.translated_subtitle
+                )
+                
+                # 更新审核状态
+                for idx in range(len(segments)):
+                    audio_exists = idx in current_session.audio_segments
+                    status[idx] = SegmentReviewStatus(
+                        audio_approved=audio_exists,  # 正确反映音频状态
+                        needs_regeneration=not audio_exists
+                    )
             ```
-
-            文本改变 → cache_key 改变 → 自动失效
-
-            #### 自动失效策略
+            
+            #### 2. 预览功能支持磁盘加载
             ```python
-            # 字幕修改时
-            if text_modified:
-                audio_repo.delete_segment(idx, video_path)
-                status = status.mark_subtitle_modified()
+            def preview_segment(evt: gr.SelectData):  # 🔧 使用 SelectData
+                selected_row_index = evt.index[0]  # 获取行索引
+                
+                # 先从内存获取
+                audio_seg = current_session.audio_segments.get(idx)
+                
+                # 🔧 如果内存没有,尝试从磁盘加载
+                if not audio_seg:
+                    audio_seg = audio_segment_repo.load_segment(
+                        segment_index=idx,
+                        video_path=current_session.video.path,
+                        text_segment=text_seg
+                    )
+                    
+                    # 加载成功后更新到会话
+                    if audio_seg:
+                        current_session.audio_segments[idx] = audio_seg
+                
+                return str(audio_seg.file_path), ...
             ```
-
-            ### 故障恢复
-
-            #### 断点续传
+            
+            #### 3. 正确的 Gradio 事件绑定
             ```python
-            cached_segments = audio_repo.list_segments(video_path)
-            # 继续生成缺失的片段
-            for idx in missing:
-                synthesize_and_cache(idx)
+            # ❌ 错误写法
+            review_dataframe.select(
+                preview_segment,
+                inputs=[],  # 无法获取选中信息
+                outputs=[...]
+            )
+            
+            # ✅ 正确写法
+            review_dataframe.select(
+                preview_segment,  # 函数自动接收 SelectData 参数
+                outputs=[preview_audio, preview_status, ...]
+            )
             ```
-
-            #### 会话恢复
+            
+            #### 4. 步骤2 音频生成后更新会话
             ```python
-            # 会话丢失时从缓存加载
-            if session.video is None:
-                audio_segments = audio_repo.list_segments(video_path)
-                # 恢复音频片段
+            def step2_incremental_voice_cloning(...):
+                # ... 执行合成 ...
+                
+                # 🔧 确保所有音频片段都更新到会话
+                for audio_seg in result.audio_segments:
+                    current_session.audio_segments[audio_seg.segment_index] = audio_seg
+                    
+                    # 同时更新审核状态
+                    current_session.segment_review_status[idx] = SegmentReviewStatus(
+                        audio_approved=True,  # 标记音频已完成
+                        needs_regeneration=False
+                    )
             ```
-
-            ### 注意事项
-
-            ⚠️  **重要提醒**:
-            1. 修改字幕后**必须**点击"重新生成"
-            2. 预览时系统会加载缓存，确保文件路径有效
-            3. 清理缓存前请确认已保存最终视频
-            4. 大量修改时建议分批处理，避免内存占用过高
-
-            ### 扩展性
-
-            #### 支持其他TTS引擎
+            
+            ### 验证修复效果
+            
+            #### 测试步骤
+            ```bash
+            # 1. 上传视频,完成步骤1
+            ✅ 检查控制台输出:
+                "🔍 检查音频片段缓存:"
+                "✅ 共加载 X/Y 个缓存片段"
+            
+            # 2. 查看审核表格
+            ✅ "音频"列应显示:
+                - "✅ 已缓存" (如果磁盘有缓存)
+                - "未生成" (如果需要生成)
+            
+            # 3. 点击表格中任意行
+            ✅ 如果音频已缓存:
+                - 左侧音频播放器出现波形
+                - 状态显示 "✅ 音频已生成"
+                - 右侧显示片段信息和字幕文本
+            
+            # 4. 点击"开始增量语音克隆"
+            ✅ 生成过程中:
+                - 表格实时更新 "音频"列
+                - 新生成的片段可立即预览
+            
+            # 5. 点击"生成最终视频"
+            ✅ 不再提示 "音频未生成"
+            ✅ 成功合成完整视频
+            ```
+            
+            #### 缓存文件检查
+            ```bash
+            # 查看音频片段缓存
+            ls -lh .cache/audio_segments/video_name_*/
+            
+            # 应该看到:
+            seg_0000.wav
+            seg_0000.json
+            seg_0001.wav
+            seg_0001.json
+            ...
+            ```
+            
+            ### 数据流图
+            
+            ```
+            磁盘缓存                会话内存               UI显示
+            ─────────────────────────────────────────────────────
+            
+            步骤1完成后:
+            .cache/audio_segments/  →  audio_segments  →  表格"✅已缓存"
+                seg_0000.wav           {0: AudioSeg}       预览可播放
+                seg_0001.wav           {1: AudioSeg}
+            
+            步骤2生成新片段:
+            .cache/audio_segments/  ←  audio_segments  ←  TTS生成
+                seg_0002.wav        ←  {2: AudioSeg}  ←  立即更新
+                                       
+            点击预览:
+            .cache/audio_segments/  →  audio_segments  →  音频播放器
+                seg_0002.wav           读取file_path       加载音频
+            
+            步骤3合成:
+            audio_segments  →  合并所有片段  →  完整音轨  →  最终视频
+            {0,1,2,...}
+            ```
+            
+            ### 性能优化
+            
+            #### 懒加载策略
+            - **步骤1**: 只加载元数据,不加载音频数据
+            - **预览时**: 按需加载音频文件
+            - **步骤3**: 批量读取所有音频
+            
+            #### 内存管理
             ```python
-            class CustomTTSAdapter(TTSProvider):
-                def synthesize(self, text, voice_profile, target_duration):
-                    # 自定义实现
-                    pass
+            # AudioSegment 只存储文件路径,不存储原始音频数据
+            @dataclass(frozen=True)
+            class AudioSegment:
+                file_path: Path  # 只存路径
+                # samples: tuple  # 不在内存中保存
+            
+            # 播放时才读取文件
+            audio_path = str(audio_seg.file_path)
+            gr.Audio(value=audio_path)  # Gradio 从文件读取
             ```
-
-            #### 支持云存储
+            
+            ### 常见问题排查
+            
+            #### Q: 步骤1后表格显示"未生成",但磁盘有缓存?
             ```python
-            class S3AudioSegmentRepository(AudioSegmentRepository):
-                def save_segment(self, idx, audio_seg, video_path):
-                    # 上传到S3
-                    pass
+            # 检查 _load_cached_audio_segments() 是否被调用
+            print(f"✅ 共加载 {len(cached_segments)} 个缓存片段")
+            
+            # 如果未输出,说明函数未执行,检查步骤1代码
             ```
-
+            
+            #### Q: 点击表格行没有反应?
+            ```python
+            # 检查事件绑定
+            review_dataframe.select(
+                preview_segment,  # ✅ 正确
+                outputs=[...]
+            )
+            
+            # 不要写成:
+            review_dataframe.select(
+                preview_segment,
+                inputs=[],  # ❌ 错误
+                outputs=[...]
+            )
+            ```
+            
+            #### Q: 预览时提示"文件不存在"?
+            ```python
+            # 检查文件路径
+            if audio_seg.file_path and audio_seg.file_path.exists():
+                return str(audio_seg.file_path)
+            else:
+                print(f"⚠️ 文件不存在: {audio_seg.file_path}")
+            ```
+            
+            #### Q: 步骤3提示"音频未生成"?
+            ```python
+            # 检查会话状态
+            print(f"内存中音频片段: {len(current_session.audio_segments)}")
+            print(f"总片段数: {len(current_session.translated_subtitle.segments)}")
+            
+            # 如果数量不匹配,说明步骤2未正确更新会话
+            ```
+            
             ### 总结
-
-            V2 版本通过**分段生成 + 增量缓存 + 实时预览**的设计：
-            - ✅ 大幅降低迭代成本（修改1个片段从10分钟降到10秒）
-            - ✅ 提升用户体验（实时反馈，无需等待）
-            - ✅ 提高系统鲁棒性（断点续传，故障恢复）
-            - ✅ 保持架构清晰（遵循洋葱架构和DDD原则）
-
-            这是**生产级**的增量处理方案，适合大规模视频处理场景。
+            
+            本次修复通过**统一磁盘缓存与内存状态**,确保:
+            - ✅ 步骤1后自动加载已缓存音频
+            - ✅ 预览功能支持磁盘+内存双重查找
+            - ✅ 步骤2生成后立即更新会话
+            - ✅ 步骤3能正确获取所有音频片段
+            
+            核心思想: **磁盘是真相,内存是缓存**
+            - 磁盘: 持久化存储,断点续传
+            - 内存: 快速访问,会话管理
+            - 同步: 双向更新,保持一致
             """)
 
     return demo

@@ -160,7 +160,8 @@ def step1_generate_and_check_v2(
         current_session.translation_context = translation_context
         current_session.source_language = src_lang
 
-        src_lang = LanguageCode(current_session.source_language.value) if current_session.source_language and current_session.source_language.value != "auto" else None
+        src_lang = LanguageCode(
+            current_session.source_language.value) if current_session.source_language and current_session.source_language.value != "auto" else None
 
         # 从缓存加载英文字幕
         cache_params = {
@@ -230,6 +231,13 @@ def step1_generate_and_check_v2(
         cached_audio_count = len(current_session.audio_segments)
         total_segments = len(result.translated_subtitle.segments)
 
+        # 🆕 计算音频时长统计
+        total_max_duration = sum(seg.time_range.duration for seg in result.translated_subtitle.segments)
+        total_actual_duration = sum(
+            len(audio_seg.audio.samples) / audio_seg.audio.sample_rate
+            for audio_seg in current_session.audio_segments.values()
+        )
+
         report_lines = [
             f"✅ 字幕生成完成",
             f"",
@@ -243,6 +251,8 @@ def step1_generate_and_check_v2(
             f"🎵 音频缓存状态:",
             f"   已缓存片段: {cached_audio_count}/{total_segments}",
             f"   需要生成: {total_segments - cached_audio_count}",
+            f"   理论总时长: {total_max_duration:.1f}s",
+            f"   已生成时长: {total_actual_duration:.1f}s",
         ]
 
         # 质量报告
@@ -270,7 +280,7 @@ def step1_generate_and_check_v2(
 
 
 def _prepare_review_data_v2():
-    """准备审核数据(包含音频播放器)"""
+    """准备审核数据(包含音频播放器和时长信息)"""
     global current_session
 
     if not current_session.translated_subtitle:
@@ -303,10 +313,19 @@ def _prepare_review_data_v2():
                     for i in segment_issues
                 ])
 
-        # 🔧 关键修复2: 正确显示音频状态
-        audio_status = "未生成"
-        if idx in current_session.audio_segments:
+        # 🔧 计算时间片最大长度（秒）
+        max_duration = trans_seg.time_range.duration
+
+        # 🔧 计算已生成音频长度
+        audio_seg = current_session.audio_segments.get(idx)
+        if audio_seg:
+            # 如果有音频，计算实际长度
+            actual_duration = len(audio_seg.audio.samples) / audio_seg.audio.sample_rate
             audio_status = "✅ 已缓存"
+            duration_str = f"{actual_duration:.2f}s"
+        else:
+            audio_status = "未生成"
+            duration_str = "-"
 
         # 审核状态
         review_status = current_session.segment_review_status.get(idx)
@@ -325,6 +344,8 @@ def _prepare_review_data_v2():
             f"{trans_seg.time_range.start_seconds:.2f}s",
             en_text,
             trans_seg.text,
+            f"{max_duration:.2f}s",  # 🆕 最大长度
+            duration_str,  # 🆕 已生成长度
             audio_status,
             "⚠️" if has_issue else "",
             review_mark
@@ -564,6 +585,7 @@ def preview_segment(evt: gr.SelectData):
     print(f"   事件类型: {type(evt)}")
     if evt:
         print(f"   evt.index: {evt.index}")
+        print(f"   evt.index 类型: {type(evt.index)}")
         print(f"   evt.value: {getattr(evt, 'value', 'N/A')}")
 
     # 🔧 防御性检查1: 检查事件对象
@@ -586,23 +608,34 @@ def preview_segment(evt: gr.SelectData):
             print(f"   ❌ evt.index 为 None")
             return None, "⚠️ 未选中任何行", "", ""
 
-        # 🔧 关键修复: evt.index 可能是元组、列表或整数
+        # 🔧 关键修复: 正确解析 evt.index
+        print(f"   原始 evt.index: {evt.index}, 类型: {type(evt.index)}")
+
         if isinstance(evt.index, (tuple, list)):
             # [row, col] 或 (row, col) 格式
-            selected_row_index = evt.index[0]
-            print(f"   ✅ 解析序列索引: {evt.index} -> 行 {selected_row_index}")
+            if len(evt.index) >= 1:
+                selected_row_index = evt.index[0]
+                print(f"   ✅ 解析序列索引: {evt.index} -> 行 {selected_row_index}")
+            else:
+                print(f"   ❌ 空序列索引")
+                return None, "❌ 索引格式错误（空序列）", "", ""
         elif isinstance(evt.index, (int, float)):
             # 直接是数字
             selected_row_index = evt.index
             print(f"   ✅ 直接使用索引: {selected_row_index}")
         else:
             # 未知格式
-            print(f"   ❌ 未知的索引格式: {type(evt.index)}")
+            print(f"   ❌ 未知的索引格式: {type(evt.index)}, 值: {evt.index}")
             return None, f"❌ 未知的索引格式: {type(evt.index)}", "", ""
 
-        # 转换为整数
-        selected_row_index = int(selected_row_index)
-        print(f"   ✅ 最终行索引: {selected_row_index}")
+        # 🔧 重要：确保转换为整数
+        try:
+            selected_row_index = int(selected_row_index)
+        except (TypeError, ValueError) as e:
+            print(f"   ❌ 无法转换为整数: {selected_row_index}, 错误: {e}")
+            return None, f"❌ 索引值无法转换为整数: {selected_row_index}", "", ""
+
+        print(f"   ✅ 最终行索引: {selected_row_index} (类型: {type(selected_row_index)})")
 
     except (TypeError, ValueError, IndexError) as e:
         print(f"   ❌ 索引解析失败: {e}")
@@ -623,9 +656,12 @@ def preview_segment(evt: gr.SelectData):
     try:
         text_seg = current_session.translated_subtitle.segments[idx]
         print(f"   ✅ 获取片段 {idx}: {text_seg.text[:30]}...")
-    except IndexError:
-        print(f"   ❌ 无法获取片段 {idx}")
-        return None, f"❌ 无法获取片段 {idx}", "", ""
+    except (IndexError, TypeError) as e:
+        print(f"   ❌ 无法获取片段 {idx}: {e}")
+        return None, f"❌ 无法获取片段 {idx}: {e}", "", ""
+
+    # 🔧 计算时长信息
+    max_duration = text_seg.time_range.duration
 
     # 🔧 关键修复5: 从会话或磁盘获取音频
     audio_seg = current_session.audio_segments.get(idx)
@@ -650,13 +686,20 @@ def preview_segment(evt: gr.SelectData):
         except Exception as e:
             print(f"   ❌ 片段 {idx} 加载失败: {e}")
 
-    # 检查音频文件
+    # 检查音频文件并计算实际时长
+    actual_duration = None
     if audio_seg and audio_seg.file_path:
         print(f"   音频文件路径: {audio_seg.file_path}")
         if audio_seg.file_path.exists():
             audio_path = str(audio_seg.file_path)
-            audio_status = "✅ 音频已生成"
-            print(f"   ✅ 音频文件存在")
+            actual_duration = len(audio_seg.audio.samples) / audio_seg.audio.sample_rate
+
+            # 🆕 计算时长差异
+            duration_diff = actual_duration - max_duration
+            duration_ratio = (actual_duration / max_duration) * 100 if max_duration > 0 else 0
+
+            audio_status = f"✅ 音频已生成 ({duration_ratio:.1f}%)"
+            print(f"   ✅ 音频文件存在，时长: {actual_duration:.2f}s")
         else:
             audio_path = None
             audio_status = f"❌ 音频文件不存在: {audio_seg.file_path.name}"
@@ -666,11 +709,31 @@ def preview_segment(evt: gr.SelectData):
         audio_status = "⚠️  音频未生成"
         print(f"   ⚠️  没有音频片段")
 
-    # 文本信息
-    text_info = f"""
+    # 🆕 文本信息 - 包含详细时长信息
+    if actual_duration:
+        duration_diff = actual_duration - max_duration
+        diff_sign = "+" if duration_diff > 0 else ""
+        text_info = f"""
 片段 #{idx}
-时间: {text_seg.time_range.start_seconds:.2f}s - {text_seg.time_range.end_seconds:.2f}s
-时长: {text_seg.time_range.duration:.2f}s
+━━━━━━━━━━━━━━━━━━━━
+⏱️  时间轴: {text_seg.time_range.start_seconds:.2f}s - {text_seg.time_range.end_seconds:.2f}s
+
+📏 时长信息:
+   • 最大允许: {max_duration:.2f}s
+   • 实际生成: {actual_duration:.2f}s
+   • 差异: {diff_sign}{duration_diff:.2f}s ({diff_sign}{(duration_diff / max_duration * 100):.1f}%)
+
+📊 状态: {'✅ 正常' if abs(duration_diff) < 0.5 else '⚠️ 偏差较大'}
+"""
+    else:
+        text_info = f"""
+片段 #{idx}
+━━━━━━━━━━━━━━━━━━━━
+⏱️  时间轴: {text_seg.time_range.start_seconds:.2f}s - {text_seg.time_range.end_seconds:.2f}s
+
+📏 时长信息:
+   • 最大允许: {max_duration:.2f}s
+   • 实际生成: 未生成
 """
 
     subtitle_text = text_seg.text
@@ -988,9 +1051,29 @@ def build_ui_v2():
                     gr.Markdown("### 2B. 审核和预览")
 
                     review_dataframe = gr.Dataframe(
-                        headers=["索引", "时间", "原文", "翻译", "音频", "问题", "状态"],
-                        datatype=["number", "str", "str", "str", "str", "str", "str"],
-                        col_count=(7, "fixed"),
+                        headers=[
+                            "索引",
+                            "时间",
+                            "原文",
+                            "翻译",
+                            "最大长度",  # 🆕 新增列
+                            "已生成长度",  # 🆕 新增列
+                            "音频",
+                            "问题",
+                            "状态"
+                        ],
+                        datatype=[
+                            "number",  # 索引
+                            "str",  # 时间
+                            "str",  # 原文
+                            "str",  # 翻译
+                            "str",  # 🆕 最大长度
+                            "str",  # 🆕 已生成长度
+                            "str",  # 音频
+                            "str",  # 问题
+                            "str"  # 状态
+                        ],
+                        col_count=(9, "fixed"),  # 🔧 改为 9 列
                         row_count=(10, "dynamic"),
                         interactive=True,
                         wrap=True,

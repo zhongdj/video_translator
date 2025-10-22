@@ -1,16 +1,11 @@
 from pathlib import Path
 
-from domain.ports import TranslationProvider
-from domain.translation_context_repository import TranslationContextRepository
-from infrastructure.adapters.asr.FasterWhisperASRAdapter import FasterWhisperASRAdapter
+from domain.ports import TranslationProvider, TTSProvider
 from infrastructure.adapters.asr.WhisperASRAdapter import WhisperASRAdapter
 from infrastructure.adapters.storage.FileCacheRepositoryAdapter import FileCacheRepositoryAdapter
 from infrastructure.adapters.storage.TranslationContextRepository import TranslationContextRepositoryAdapter
 from infrastructure.adapters.subtitle.PySRTSubtitleWriterAdapter import PySRTSubtitleWriterAdapter
-from infrastructure.adapters.translation.QwenTranslateAdapter import QwenTranslationAdapter
-from infrastructure.adapters.translation.enhanced_translation_adapter import EnhancedQwenTranslationAdapter, \
-    create_enhanced_translation_provider
-from infrastructure.adapters.tts.F5TTSAdapter import F5TTSAdapter
+from infrastructure.adapters.translation.enhanced_translation_adapter import create_enhanced_translation_provider
 from infrastructure.adapters.tts.indextts_adapter import IndexTTSAdapter
 from infrastructure.adapters.video.FFmpegVideoProcessorAdapter import FFmpegVideoProcessorAdapter
 
@@ -49,7 +44,7 @@ class DependencyContainer:
             self._translator = create_enhanced_translation_provider()
         return self._translator
 
-    def get_tts(self) -> F5TTSAdapter:
+    def get_tts(self) -> TTSProvider:
         """获取 TTS 提供者（懒加载）"""
         if self._tts is None:
             self._tts = IndexTTSAdapter()
@@ -63,8 +58,6 @@ class DependencyContainer:
             self._translator.unload()
         if self._tts:
             self._tts.unload()
-
-
 
 # 全局容器
 container = DependencyContainer()

@@ -101,6 +101,9 @@ class EnhancedQwenTranslationAdapter(TranslationProvider):
             {"role": "user", "content": text}
         ]
 
+        if self.model is None:
+            self._load_model()
+
         # 使用tokenizer的chat template
         input_text = self.tokenizer.apply_chat_template(
             messages,
@@ -114,8 +117,7 @@ class EnhancedQwenTranslationAdapter(TranslationProvider):
             padding=True
         ).to(self.device)
 
-        if self.model is None:
-            self._load_model()
+
 
         with torch.no_grad():
             outputs = self.model.generate(

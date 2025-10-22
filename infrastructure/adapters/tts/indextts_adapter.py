@@ -1,15 +1,12 @@
 # infrastructure/adapters/tts/indextts_adapter.py
-import os
 import sys
 import time
-from pathlib import Path
-from typing import Optional, Tuple
+
 import numpy as np
 import torch
-import torchaudio
 
-from domain.ports import TTSProvider
 from domain.entities import *
+from domain.ports import TTSProvider
 
 
 class IndexTTSAdapter(TTSProvider):

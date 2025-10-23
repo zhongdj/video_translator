@@ -66,6 +66,19 @@ class IndexTTSAdapter(TTSProvider):
             "oom_count": 0,
             "peak_memory_gb": 0.0
         }
+        # 速度配置
+        self.speed = 1.0  # 默认速度
+        self.speed_index = 0  # IndexTTS2 使用整数索引控制速度
+
+        # 速度映射表 (根据 IndexTTS2 的实际实现)
+        # 通常: 0=正常, 1=稍快, 2=快, -1=稍慢, -2=慢
+        self.speed_mapping = {
+            0.5: -2,  # 0.5x -> 很慢
+            0.75: -1,  # 0.75x -> 稍慢
+            1.0: 0,  # 1.0x -> 正常
+            1.25: 1,  # 1.25x -> 稍快
+            1.5: 2,  # 1.5x -> 快
+        }
 
 
     def load(self):
@@ -174,60 +187,64 @@ class IndexTTSAdapter(TTSProvider):
         self._is_loaded = False
         print(f"✅ IndexTTS2 模型已卸载")
 
+    def _speed_to_index(self, speed: float) -> int:
+        """将速度因子转换为 IndexTTS2 的速度索引"""
+        # 找到最接近的预定义速度
+        closest_speed = min(self.speed_mapping.keys(),
+                            key=lambda x: abs(x - speed))
+        return self.speed_mapping[closest_speed]
+
     def synthesize(
             self,
             text: str,
             voice_profile: VoiceProfile,
             target_duration: Optional[float] = None
     ) -> AudioSample:
-        """单句合成（兼容旧接口）"""
+        """单句合成(兼容旧接口)"""
         if not self._is_loaded:
             self.load()
 
-        # 如果指定了 target_duration，先试合成一次估算时长
+        # 如果指定了 target_duration,先试合成一次估算时长
         if target_duration is not None:
+            # 第一次合成(使用默认速度)
             results = self.batch_synthesize(
                 texts=[text],
                 reference_audio_path=voice_profile.reference_audio_path,
                 language=voice_profile.language,
-                batch_size=8
+                batch_size=8,
+                speed_factor=1.0  # 明确传递速度
             )
             audio = results[0]
             actual_duration = len(audio.samples) / audio.sample_rate
 
-            # 如果超时，调整语速重新合成
+            # 如果超时,调整语速重新合成
             if actual_duration > target_duration:
-                speed_factor = actual_duration / (0.95 *target_duration)
-                adjusted_speed = min(self.speed * speed_factor, 2.0)  # 最大2倍速
-                print(
-                    f"  ⚡ 音频过长 ({actual_duration:.2f}s > {target_duration:.2f}s)，调整语速至 {adjusted_speed:.2f}x")
+                speed_factor = actual_duration / (0.95 * target_duration)
+                adjusted_speed = min(speed_factor, 2.0)  # 最大2倍速
 
-                # 保存原始语速
-                original_speed = self.speed
-                self.speed = adjusted_speed
+                print(f"  ⚡ 音频过长 ({actual_duration:.2f}s > {target_duration:.2f}s)")
+                print(f"     调整语速至 {adjusted_speed:.2f}x 重新合成")
 
-                # 重新合成
+                # 重新合成(使用调整后的速度)
                 results = self.batch_synthesize(
                     texts=[text],
                     reference_audio_path=voice_profile.reference_audio_path,
                     language=voice_profile.language,
-                    batch_size=8
+                    batch_size=8,
+                    speed_factor=adjusted_speed  # 传递调整后的速度
                 )
-
-                # 恢复原始语速
-                self.speed = original_speed
 
             return results[0]
 
-        # 没有 target_duration，直接合成
+        # 没有 target_duration,直接合成
         results = self.batch_synthesize(
             texts=[text],
             reference_audio_path=voice_profile.reference_audio_path,
             language=voice_profile.language,
-            batch_size=8
+            batch_size=8,
+            speed_factor=1.0  # 默认速度
         )
         return results[0]
-
 
 
     def suggest_batch_size(self, texts: list[str]) -> int:
@@ -267,28 +284,26 @@ class IndexTTSAdapter(TTSProvider):
             texts: list[str],
             reference_audio_path: Path,
             language: LanguageCode,
-            batch_size: Optional[int] = None
+            batch_size: Optional[int] = None,
+            speed_factor: float = 1.0  # 🔥 新增速度参数
     ) -> tuple[AudioSample, ...]:
         """
-        批量合成（自适应 batch_size）
+        批量合成(自适应 batch_size)
 
         Args:
-            texts: 待合成文本列表
-            reference_audio_path: 参考音频路径
-            language: 目标语言
-            batch_size: 批量大小（None 则自动建议）
+            speed_factor: 语速因子 (1.0=正常, >1.0=加快, <1.0=减慢)
         """
         if not self._is_loaded:
             self.load()
 
         total_texts = len(texts)
-        print(f"  📝 批量合成: {total_texts} 个文本片段，batch_size={batch_size}")
+        print(f"  📝 批量合成: {total_texts} 个文本片段, speed={speed_factor}x")
 
-        # 尝试批量合成，失败则自动降级
         try:
             return self._batch_synthesize_with_recovery(
                 texts=texts,
-                reference_audio_path=reference_audio_path
+                reference_audio_path=reference_audio_path,
+                speed_factor=speed_factor  # 🔥 传递速度参数
             )
         except Exception as e:
             print(f"❌ 批量合成失败: {e}")
@@ -297,91 +312,87 @@ class IndexTTSAdapter(TTSProvider):
     def _batch_synthesize_with_recovery(
             self,
             texts: list[str],
-            reference_audio_path: Path
+            reference_audio_path: Path,
+            speed_factor: float = 1.0  # 🔥 新增参数
     ) -> tuple[AudioSample, ...]:
         """带 OOM 自动恢复的批量合成"""
-
         try:
             return self._do_batch_synthesize(
                 texts=texts,
-                reference_audio_path=reference_audio_path
+                reference_audio_path=reference_audio_path,
+                speed_factor=speed_factor  # 🔥 传递参数
             )
         except RuntimeError as e:
             if "out of memory" in str(e).lower() and self.enable_auto_recovery:
-                # OOM 发生，尝试恢复
                 self.stats["oom_count"] += 1
             raise
         finally:
-            # 清理内存
             torch.cuda.empty_cache()
 
     def _do_batch_synthesize(
             self,
             texts: list[str],
-            reference_audio_path: Path
+            reference_audio_path: Path,
+            speed_factor: float = 1.0  # 🔥 新增参数
     ) -> tuple[AudioSample, ...]:
         """实际执行批量合成"""
-
         print(f"  ⚠️  reference audio path: {str(reference_audio_path)}")
+        print(f"  ⚡ speed factor: {speed_factor}x")
+
         total_texts = len(texts)
         all_audio_samples = []
-
         batch_start_time = time.perf_counter()
 
-        # 🔥 关键修复：直接调用 batch_infer_same_speaker，不做任何分批
-        print(f"    批次处理: {len(texts)} 个片段")
+        # 转换速度因子为 IndexTTS2 的速度索引
+        speed_index = self._speed_to_index(speed_factor)
+        print(f"  📊 speed_index={speed_index} (mapped from {speed_factor}x)")
 
-        iter_start = time.perf_counter()
-
-        # 调用批量推理 - 关键：output_paths=None，让它返回音频数据而非文件路径
+        # 🔥 关键修复:调用 batch_infer_same_speaker,传递速度参数
         batch_results = self.model.batch_infer_same_speaker(
             texts=texts,
             spk_audio_prompt=str(reference_audio_path),
-            output_paths=None,  # 🔥 重要：返回音频数据而非保存文件
+            output_paths=None,
             emo_audio_prompt=None,
             emo_alpha=1.0,
-            interval_silence=0,  # 🔥 重要：不插入静音，保持原始音频
+            interval_silence=0,
             verbose=True,
             max_text_tokens_per_segment=120,
+            speed_index=speed_index,  # 🔥 传递速度索引
+            # generation_kwargs
             do_sample=True,
-            top_p=0.8,
+            top_p=self.top_p,
             top_k=30,
-            temperature=0.8,
+            temperature=self.temperature,
             length_penalty=0.0,
             num_beams=3,
             repetition_penalty=10.0,
             max_mel_tokens=1500
         )
 
-        iter_time = time.perf_counter() - iter_start
+        iter_time = time.perf_counter() - batch_start_time
 
         # 记录内存峰值
         if torch.cuda.is_available():
             peak_memory = torch.cuda.max_memory_allocated() / 1e9
             self.stats["peak_memory_gb"] = max(self.stats["peak_memory_gb"], peak_memory)
-            print(f" ✓ {iter_time:.2f}秒 (GPU: {peak_memory:.1f}GB)")
+            print(f" ✓ {iter_time:.2f}秒 (GPU: {peak_memory:.1f}GB, speed: {speed_factor}x)")
         else:
-            print(f" ✓ {iter_time:.2f}秒")
+            print(f" ✓ {iter_time:.2f}秒 (speed: {speed_factor}x)")
 
-        # 🔥 关键修复：正确处理返回值格式
+        # 处理返回值
         for result in batch_results:
-            # batch_infer_same_speaker 返回 (sampling_rate, wav_data_numpy)
             if isinstance(result, tuple) and len(result) == 2:
                 sampling_rate, wav_data = result
 
-                # wav_data 已经是 numpy array，形状为 (samples, channels) 或 (samples,)
-                # 需要转换为一维数组
                 if wav_data.ndim == 2:
-                    wav_data = wav_data[:, 0]  # 取第一个声道
+                    wav_data = wav_data[:, 0]
                 elif wav_data.ndim == 1:
-                    pass  # 已经是一维
+                    pass
                 else:
                     print(f"⚠️ 未预期的音频维度: {wav_data.shape}")
                     wav_data = wav_data.flatten()
 
-                # 🔥 重要：保持原始 int16 格式，不要做额外的归一化
-                # IndexTTS2 已经做了 torch.clamp(32767 * wav, -32767.0, 32767.0)
-                # 转换为 float 只需要除以 32767
+                # 转换为 float32 格式
                 wav_float = wav_data.astype(np.float32) / 32767.0
 
                 audio_sample = AudioSample(
@@ -393,7 +404,7 @@ class IndexTTSAdapter(TTSProvider):
                 print(f"⚠️ 未预期的返回格式: {type(result)}")
                 continue
 
-        # 主动清理 CUDA 缓存
+        # 清理缓存
         del batch_results
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

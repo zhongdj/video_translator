@@ -104,7 +104,7 @@ class TTSProvider(ABC):
 
 
 class VideoProcessor(Protocol):
-    """视频处理器接口"""
+    """视频处理器接口（增强版）"""
 
     def extract_audio(self, video: Video) -> Path:
         """从视频提取音频"""
@@ -113,9 +113,20 @@ class VideoProcessor(Protocol):
     def extract_reference_audio(
             self,
             video: Video,
-            duration: float
+            duration: float,
+            start_offset: float = 0.0  # ✅ 新增: 起始偏移（秒）
     ) -> Path:
-        """提取参考音频片段"""
+        """
+        提取参考音频片段
+
+        Args:
+            video: 视频对象
+            duration: 提取时长（秒）
+            start_offset: 起始偏移（秒），默认从头开始
+
+        Returns:
+            参考音频文件路径
+        """
         ...
 
     def merge_audio_video(
@@ -263,7 +274,11 @@ class AudioSegmentRepository(Protocol):
 
 
 class AudioFileRepository(Protocol):
-    """音频文件仓储接口"""
+    """
+    音频文件仓储接口（增强版）
+
+    ✅ 需求3: 管理参考音频的持久化
+    """
 
     def save_audio(
             self,
@@ -285,3 +300,47 @@ class AudioFileRepository(Protocol):
         """检查音频是否存在"""
         ...
 
+    def delete(self, cache_key: str) -> bool:
+        """删除音频文件"""
+        ...
+
+    # ✅ 新增: 参考音频管理方法
+
+    def save_reference_audio(
+            self,
+            video_path: Path,
+            source_audio_path: Path
+    ) -> Path:
+        """
+        保存参考音频（从Gradio临时文件或视频提取）
+
+        Args:
+            video_path: 关联的视频路径（用于生成缓存键）
+            source_audio_path: 源音频路径（Gradio临时文件或提取的音频）
+
+        Returns:
+            持久化后的参考音频路径
+        """
+        ...
+
+    def load_reference_audio(
+            self,
+            video_path: Path
+    ) -> Optional[Path]:
+        """
+        加载参考音频路径
+
+        Args:
+            video_path: 关联的视频路径
+
+        Returns:
+            参考音频路径，不存在则返回None
+        """
+        ...
+
+    def delete_reference_audio(
+            self,
+            video_path: Path
+    ) -> bool:
+        """删除参考音频"""
+        ...

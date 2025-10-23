@@ -112,3 +112,92 @@ class AudioFileRepositoryAdapter(AudioFileRepository):
                 samples=tuple(samples),
                 sample_rate=sample_rate
             )
+
+    # ============== ✅ 新增: 参考音频管理 ============== #
+
+    def save_reference_audio(
+            self,
+            video_path: Path,
+            source_audio_path: Path
+    ) -> Path:
+        """
+        保存参考音频（持久化Gradio临时文件或视频提取的音频）
+
+        Args:
+            video_path: 关联的视频路径
+            source_audio_path: 源音频路径
+
+        Returns:
+            持久化后的参考音频路径
+        """
+        import hashlib
+        import shutil
+
+        # 创建参考音频目录
+        ref_audio_dir = self.base_dir.parent / "reference_audio"
+        ref_audio_dir.mkdir(parents=True, exist_ok=True)
+
+        # 生成唯一文件名
+        video_hash = hashlib.md5(str(video_path).encode()).hexdigest()[:8]
+        video_name = video_path.stem
+        file_ext = source_audio_path.suffix or ".wav"
+
+        persistent_path = ref_audio_dir / f"{video_name}_{video_hash}_ref{file_ext}"
+
+        # 复制文件
+        shutil.copy2(source_audio_path, persistent_path)
+
+        print(f"✅ 参考音频已持久化:")
+        print(f"   源路径: {source_audio_path}")
+        print(f"   持久路径: {persistent_path}")
+
+        return persistent_path
+
+    def load_reference_audio(
+            self,
+            video_path: Path
+    ) -> Optional[Path]:
+        """
+        加载参考音频路径
+
+        Args:
+            video_path: 关联的视频路径
+
+        Returns:
+            参考音频路径，不存在则返回None
+        """
+        import hashlib
+
+        ref_audio_dir = self.base_dir.parent / "reference_audio"
+        if not ref_audio_dir.exists():
+            return None
+
+        video_hash = hashlib.md5(str(video_path).encode()).hexdigest()[:8]
+        video_name = video_path.stem
+
+        # 查找匹配的文件（支持多种格式）
+        pattern = f"{video_name}_{video_hash}_ref.*"
+        matches = list(ref_audio_dir.glob(pattern))
+
+        if matches:
+            return matches[0]
+
+        return None
+
+    def delete_reference_audio(
+            self,
+            video_path: Path
+    ) -> bool:
+        """删除参考音频"""
+        ref_audio_path = self.load_reference_audio(video_path)
+
+        if ref_audio_path and ref_audio_path.exists():
+            try:
+                ref_audio_path.unlink()
+                print(f"🗑️  已删除参考音频: {ref_audio_path}")
+                return True
+            except Exception as e:
+                print(f"⚠️  删除失败: {e}")
+                return False
+
+        return False

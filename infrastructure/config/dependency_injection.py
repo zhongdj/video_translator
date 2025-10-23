@@ -21,7 +21,7 @@ class DependencyContainer:
         self.video_processor = FFmpegVideoProcessorAdapter()
         self.subtitle_writer = PySRTSubtitleWriterAdapter()
         self.translator_context_repo = TranslationContextRepositoryAdapter(Path("./translation_contexts"))
-        self.audio_repo = AudioFileRepositoryAdapter()
+        self.audio_file_repo = AudioFileRepositoryAdapter()
         self.audio_segment_repo = AudioSegmentRepositoryAdapter()
         self.cache_service = CacheService(self.cache_repo)
         # 懒加载的模型

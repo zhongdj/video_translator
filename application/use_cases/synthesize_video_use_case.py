@@ -118,8 +118,8 @@ def synthesize_video_use_case(
         formats=("srt", "ass")  # 双语字幕生成所有格式
     )
 
-    bilingual_with_path = bilingual_with_paths[2]
-    print(bilingual_with_path)
+    target_subtitles_path = bilingual_with_paths[len(bilingual_with_paths) - 1]
+    print(target_subtitles_path)
 
     # 2. 合并音视频（如果有配音）
     if audio_track is not None:
@@ -136,20 +136,20 @@ def synthesize_video_use_case(
         print(f"🎤 生成配音视频: {voiced_output.name}")
 
         # 为配音视频烧录双语字幕（如果有双语字幕）
-        if burn_subtitles and len(subtitles) >= 3:
-            if progress:
-                progress(0.7, "为配音视频烧录双语字幕")
+        if progress:
+            progress(0.7, "为配音视频烧录双语字幕")
 
-            voiced_subtitled = output_dir / f"{video.path.stem}_voiced_subtitled.mp4"
-            video_processor.burn_subtitles(
-                Video(path = voiced_output,
-                      duration=video.duration,
-                      has_audio=True),  # 基于配音视频
-                bilingual_with_path,
-                voiced_subtitled
-            )
-            output_paths.append(voiced_subtitled)
-            print(f"🎬 生成配音+双语字幕视频: {voiced_subtitled.name}")
+        voiced_subtitled = output_dir / f"{video.path.stem}_voiced_subtitled.mp4"
+        video_processor.burn_subtitles(
+            Video(path = voiced_output,
+                  duration=video.duration,
+                  has_audio=True),  # 基于配音视频
+            target_subtitles_path,
+            voiced_subtitled
+        )
+        output_paths.append(voiced_subtitled)
+        print(f"🎬 生成配音+双语字幕视频: {voiced_subtitled.name}")
+
 
 
 

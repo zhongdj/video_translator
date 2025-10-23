@@ -1,21 +1,26 @@
+"""
+Infrastructure Layer - 增强的FFmpeg视频处理适配器
+
+✅ 需求1: 支持可配置的参考音频起始偏移和时长
+"""
+
 import subprocess
-from typing import Union
+import tempfile
+from pathlib import Path
 
 import numpy as np
 import torch
 import torchaudio
 
-from domain.entities import *
+from domain.entities import Video, AudioTrack, Subtitle
 from domain.ports import VideoProcessor
 
 
 class FFmpegVideoProcessorAdapter(VideoProcessor):
-    """FFmpeg 视频处理适配器"""
+    """FFmpeg 视频处理适配器（增强版）"""
 
     def extract_audio(self, video: Video) -> Path:
         """从视频提取音频"""
-        import tempfile
-
         temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
         output_path = Path(temp_file.name)
         temp_file.close()
@@ -34,68 +39,104 @@ class FFmpegVideoProcessorAdapter(VideoProcessor):
     def extract_reference_audio(
             self,
             video: Video,
-            duration: float
+            duration: float,
+            start_offset: float = 0.0  # ✅ 新增参数
     ) -> Path:
-        """提取参考音频片段（使用 VAD 检测最佳片段）"""
+        """
+        提取参考音频片段（增强版）
+
+        Args:
+            video: 视频对象
+            duration: 提取时长（秒）
+            start_offset: 起始偏移（秒），默认从头开始
+
+        特性:
+        1. 支持指定起始位置（如跳过前30秒）
+        2. 使用VAD检测最佳语音片段（如果start_offset=0）
+        3. 自动调整时长不超过视频长度
+        """
         import tempfile
 
         # 先提取完整音频
         full_audio = self.extract_audio(video)
 
         try:
-            # 使用 silero-vad 检测语音区域
-            model, utils = torch.hub.load(
-                repo_or_dir='snakers4/silero-vad',
-                model='silero_vad',
-                force_reload=False
-            )
-            (get_speech_timestamps, _, read_audio, *_) = utils
+            # ✅ 情况1: 指定了起始偏移（直接提取，不使用VAD）
+            if start_offset > 0:
+                print(f"📍 使用指定偏移: {start_offset}s")
+                extract_start = start_offset
+                extract_duration = min(duration, video.duration - start_offset)
 
-            wav = read_audio(str(full_audio), sampling_rate=16000)
-            speech_timestamps = get_speech_timestamps(
-                wav, model,
-                sampling_rate=16000,
-                threshold=0.5
-            )
+                if extract_duration <= 0:
+                    raise ValueError(
+                        f"起始偏移 {start_offset}s 超出视频长度 {video.duration}s"
+                    )
 
-            # 选择最长且能量最高的片段
-            if speech_timestamps:
-                best_segment = max(
-                    speech_timestamps,
-                    key=lambda ts: (ts['end'] - ts['start']) * torch.sum(wav[ts['start']:ts['end']] ** 2)
-                )
-
-                start_sec = best_segment['start'] / 16000
-                extract_duration = min((best_segment['end'] - best_segment['start']) / 16000, duration)
+            # ✅ 情况2: 未指定偏移（使用VAD检测最佳片段）
             else:
-                # 如果没检测到，使用开头部分
-                start_sec = 0
-                extract_duration = min(duration, video.duration)
+                print(f"🔍 使用VAD检测最佳语音片段...")
+                try:
+                    model, utils = torch.hub.load(
+                        repo_or_dir='snakers4/silero-vad',
+                        model='silero_vad',
+                        force_reload=False
+                    )
+                    (get_speech_timestamps, _, read_audio, *_) = utils
 
-        except Exception as e:
-            print(f"⚠️ VAD 检测失败: {e}，使用默认策略")
-            start_sec = 0
-            extract_duration = min(duration, video.duration)
+                    wav = read_audio(str(full_audio), sampling_rate=16000)
+                    speech_timestamps = get_speech_timestamps(
+                        wav, model,
+                        sampling_rate=16000,
+                        threshold=0.5
+                    )
 
-        # 提取指定片段
-        temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        output_path = Path(temp_file.name)
-        temp_file.close()
+                    # 选择最长且能量最高的片段
+                    if speech_timestamps:
+                        best_segment = max(
+                            speech_timestamps,
+                            key=lambda ts: (ts['end'] - ts['start']) * torch.sum(wav[ts['start']:ts['end']] ** 2)
+                        )
 
-        subprocess.run([
-            'ffmpeg', '-y',
-            '-ss', str(start_sec),
-            '-t', str(extract_duration),
-            '-i', str(full_audio),
-            '-ac', '1',
-            '-ar', '24000',  # F5-TTS 使用 24kHz
-            str(output_path)
-        ], check=True, capture_output=True)
+                        extract_start = best_segment['start'] / 16000
+                        extract_duration = min(
+                            (best_segment['end'] - best_segment['start']) / 16000,
+                            duration
+                        )
+                        print(f"✅ VAD检测到最佳片段: {extract_start:.2f}s")
+                    else:
+                        # VAD未检测到，使用默认策略
+                        extract_start = 0
+                        extract_duration = min(duration, video.duration)
+                        print(f"⚠️  VAD未检测到语音，使用默认片段")
 
-        # 清理临时文件
-        full_audio.unlink()
+                except Exception as e:
+                    print(f"⚠️  VAD检测失败: {e}，使用默认策略")
+                    extract_start = 0
+                    extract_duration = min(duration, video.duration)
 
-        return output_path
+            # 提取指定片段
+            temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            output_path = Path(temp_file.name)
+            temp_file.close()
+
+            print(f"🎵 提取参考音频: {extract_start:.2f}s - {extract_start + extract_duration:.2f}s")
+
+            subprocess.run([
+                'ffmpeg', '-y',
+                '-ss', str(extract_start),
+                '-t', str(extract_duration),
+                '-i', str(full_audio),
+                '-ac', '1',
+                '-ar', '24000',  # TTS使用24kHz
+                str(output_path)
+            ], check=True, capture_output=True)
+
+            return output_path
+
+        finally:
+            # 清理临时文件
+            if full_audio.exists():
+                full_audio.unlink()
 
     def merge_audio_video(
             self,
@@ -145,28 +186,22 @@ class FFmpegVideoProcessorAdapter(VideoProcessor):
         """烧录字幕到视频"""
         import tempfile
         import shutil
-        from domain.ports import SubtitleWriter
 
         try:
-            # 创建输出目录
             output_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # 使用临时目录工作，避免路径问题
             with tempfile.TemporaryDirectory() as tmpdir:
                 tmpdir_path = Path(tmpdir)
 
-                # 复制视频文件到临时目录
                 temp_video = tmpdir_path / "video.mp4"
                 temp_subtitle = tmpdir_path / "subtitle.ass"
                 temp_output = tmpdir_path / "output.mp4"
 
-                # 使用断言确保路径存在
                 assert subtitle.path is not None, "字幕文件路径不能为空"
 
                 shutil.copy2(video.path, temp_video)
                 shutil.copy2(subtitle.path, temp_subtitle)
 
-                # 使用相对路径
                 subtitle_filter = "subtitles=subtitle.ass"
 
                 # 尝试硬件编码
@@ -175,14 +210,12 @@ class FFmpegVideoProcessorAdapter(VideoProcessor):
                     '-i', 'video.mp4',
                     '-vf', subtitle_filter,
                     '-c:v', 'h264_nvenc',
-                    '-preset', 'p4',  # p1最快，p7最慢
-                    '-cq', '23',  # 恒定质量模式
-                    '-rc', 'vbr',  # 可变比特率
+                    '-preset', 'p4',
+                    '-cq', '23',
+                    '-rc', 'vbr',
                     '-c:a', 'copy',
                     '-y', 'output.mp4'
                 ]
-
-                print(f"执行 FFmpeg 命令: {' '.join(cmd_hardware)} (在临时目录: {tmpdir})")
 
                 try:
                     result = subprocess.run(
@@ -194,16 +227,13 @@ class FFmpegVideoProcessorAdapter(VideoProcessor):
                     )
 
                     if result.returncode == 0:
-                        # 复制输出文件
                         shutil.copy2(temp_output, output_path)
                         print(f"✅ 硬件编码成功: {output_path}")
                         return output_path
                     else:
-                        print(f"硬件编码失败: {result.stderr}")
                         raise RuntimeError("硬件编码失败")
 
-                except subprocess.CalledProcessError:
-                    # 回退到软件编码
+                except (subprocess.CalledProcessError, RuntimeError):
                     print("🔄 硬件编码失败，尝试软件编码...")
 
                     cmd_software = [

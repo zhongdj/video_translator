@@ -5,7 +5,7 @@ Application Layer - 翻译质量检查用例
 from dataclasses import dataclass
 from typing import Optional, Callable
 
-from domain.entities import Subtitle, TextSegment, LanguageCode
+from domain.entities import Subtitle, TextSegment
 from domain.ports import TranslationProvider
 
 

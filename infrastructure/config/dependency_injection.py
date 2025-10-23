@@ -1,9 +1,12 @@
 from pathlib import Path
 
-from domain.ports import TranslationProvider, TTSProvider
+from application.services.cache_service import CacheService
+from domain.ports import TranslationProvider, TTSProvider, AudioFileRepository
 from infrastructure.adapters.asr.WhisperASRAdapter import WhisperASRAdapter
 from infrastructure.adapters.storage.FileCacheRepositoryAdapter import FileCacheRepositoryAdapter
 from infrastructure.adapters.storage.TranslationContextRepository import TranslationContextRepositoryAdapter
+from infrastructure.adapters.storage.audio_file_repository_adapter import AudioFileRepositoryAdapter
+from infrastructure.adapters.storage.audio_segment_repository_adapter import AudioSegmentRepositoryAdapter
 from infrastructure.adapters.subtitle.PySRTSubtitleWriterAdapter import PySRTSubtitleWriterAdapter
 from infrastructure.adapters.translation.enhanced_translation_adapter import create_enhanced_translation_provider
 from infrastructure.adapters.tts.indextts_adapter import IndexTTSAdapter
@@ -18,7 +21,9 @@ class DependencyContainer:
         self.video_processor = FFmpegVideoProcessorAdapter()
         self.subtitle_writer = PySRTSubtitleWriterAdapter()
         self.translator_context_repo = TranslationContextRepositoryAdapter(Path("./translation_contexts"))
-
+        self.audio_repo = AudioFileRepositoryAdapter()
+        self.audio_segment_repo = AudioSegmentRepositoryAdapter()
+        self.cache_service = CacheService(self.cache_repo)
         # 懒加载的模型
         self._asr = None
         self._translator = None

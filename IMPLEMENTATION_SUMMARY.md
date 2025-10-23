@@ -238,7 +238,7 @@ mkdir -p video_translator/{domain,application,infrastructure/{adapters,ui,config
 pip install -r requirements.txt
 
 # 4. 启动
-python video_translator/infrastructure/ui/webui.py
+python video_translator/infrastructure/ui/improved_webui_v2.py
 ```
 
 ### 方式 2: 逐步重构现有代码

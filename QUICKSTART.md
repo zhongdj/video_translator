@@ -36,7 +36,7 @@ pip install f5-tts
 ### 2. 启动 WebUI
 
 ```bash
-python infrastructure/ui/webui.py
+python infrastructure/ui/improved_webui_v2.py
 ```
 
 访问 `http://localhost:7860` 即可使用！
@@ -657,7 +657,7 @@ in the Software without restriction...
 pip install -r requirements.txt
 
 # 2. 启动 WebUI
-python infrastructure/ui/webui.py
+python infrastructure/ui/improved_webui_v2.py
 
 # 3. 打开浏览器
 # http://localhost:7860

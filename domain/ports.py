@@ -184,7 +184,6 @@ class FileStorage(Protocol):
 """
 Domain Layer - 音频片段仓储接口
 """
-from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Protocol, Optional, List
 from domain.entities import AudioSegment, TextSegment
@@ -261,3 +260,28 @@ class AudioSegmentRepository(Protocol):
     ) -> Path:
         """获取片段的存储路径（用于前端播放）"""
         ...
+
+
+class AudioFileRepository(Protocol):
+    """音频文件仓储接口"""
+
+    def save_audio(
+            self,
+            cache_key: str,
+            audio: AudioSample,
+            metadata: dict
+    ) -> Path:
+        """保存音频到持久化存储"""
+        ...
+
+    def load_audio(
+            self,
+            cache_key: str
+    ) -> tuple[Optional[AudioSample], Optional[dict]]:
+        """从持久化存储加载音频"""
+        ...
+
+    def exists(self, cache_key: str) -> bool:
+        """检查音频是否存在"""
+        ...
+

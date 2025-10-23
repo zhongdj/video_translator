@@ -133,7 +133,7 @@ class ASRProvider(Protocol):
 #### 文件组织
 
 ```python
-# application/use_cases/generate_subtitles.py
+# application/use_cases/improved_generate_subtitles.py
 def generate_subtitles_use_case(
     video: Video,
     asr_provider: ASRProvider,          # 依赖接口
@@ -186,7 +186,7 @@ class WhisperASRAdapter:
 #### 3.2 UI（用户界面）
 
 ```python
-# infrastructure/ui/webui.py
+# infrastructure/ui/improved_webui_v2.py
 def process_single_video_ui(video_file, ...):
     """UI 处理函数（有副作用）"""
     
@@ -446,7 +446,7 @@ class Wav2LipAdapter:
 #### Step 4: 在 UI 中集成
 
 ```python
-# infrastructure/ui/webui.py
+# infrastructure/ui/improved_webui_v2.py
 def process_with_lip_sync_ui(video_file, ...):
     """UI 处理函数"""
     container = DependencyContainer()
@@ -532,7 +532,7 @@ pip install f5-tts
 
 ```bash
 # 启动 WebUI
-python scripts/run_webui.py
+python scripts/run_webui_v2.py
 
 # 或使用 CLI
 python infrastructure/ui/cli.py process video.mp4 \

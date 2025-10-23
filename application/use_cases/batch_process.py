@@ -11,7 +11,6 @@
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Callable, List, Tuple
-from datetime import datetime
 
 from domain.entities import (
     Video, Subtitle, AudioTrack, ProcessedVideo,
@@ -20,15 +19,14 @@ from domain.entities import (
 from domain.ports import (
     ASRProvider, TranslationProvider, TTSProvider,
     VideoProcessor, SubtitleWriter, CacheRepository,
+    AudioFileRepository,
 )
 from domain.services import (
     merge_bilingual_subtitles,
     calculate_cache_key,
 )
 
-
 # ============== 中间数据结构 ============== #
-
 @dataclass(frozen=True)
 class VideoWithSubtitles:
     """
@@ -59,8 +57,98 @@ class VideoWithAudio:
     cache_hit_audio: bool
 
 
-# ============== 字幕缓存辅助函数 ============== #
+# ============== 辅助函数（纯逻辑） ============== #
+def _serialize_segments(segments: tuple[TextSegment, ...]) -> list:
+    """序列化文本片段为字典列表"""
+    return [
+        {
+            "text": seg.text,
+            "start": seg.time_range.start_seconds,
+            "end": seg.time_range.end_seconds
+        }
+        for seg in segments
+    ]
 
+
+def _deserialize_segments(
+    data: List[dict],
+    language: LanguageCode
+) -> Tuple[TextSegment, ...]:
+    """反序列化文本片段"""
+    return tuple(
+        TextSegment(
+            text=item["text"],
+            time_range=TimeRange(
+                start_seconds=item["start"],
+                end_seconds=item["end"],
+            ),
+            language=language
+        )
+        for item in data
+    )
+
+
+# ============== 音频处理（重构版） ============== #
+def _load_audio_from_cache(
+        audio_repo: AudioFileRepository,  # ✅ 使用Port接口
+        cache_key: str,
+        language: LanguageCode
+) -> Optional[AudioTrack]:
+    """从缓存加载音频轨道（纯函数）"""
+    audio_sample, metadata = audio_repo.load_audio(cache_key)
+
+    if audio_sample is None:
+        return None
+
+    return AudioTrack(audio_sample, language)
+
+
+def _save_audio_to_cache(
+        audio_repo: AudioFileRepository,  # ✅ 使用Port接口
+        cache_key: str,
+        audio_track: AudioTrack,
+        reference_audio_path: Path
+) -> None:
+    """保存音频到缓存（纯函数）"""
+    metadata = {
+        "language": audio_track.language.value,
+        "sample_rate": audio_track.audio.sample_rate,
+        "reference_audio": str(reference_audio_path),
+    }
+
+    audio_repo.save_audio(cache_key, audio_track.audio, metadata)
+
+
+def _assemble_full_audio(
+        synthesized_audios: tuple,
+        segments: tuple[TextSegment, ...],
+        video_duration: float,
+        language: LanguageCode
+) -> AudioTrack:
+    """拼接音频片段（纯逻辑）"""
+    if not synthesized_audios:
+        raise ValueError("没有可拼接的音频")
+
+    sample_rate = synthesized_audios[0].sample_rate
+    total_samples = int(video_duration * sample_rate)
+    full_audio_list = [0.0] * total_samples
+
+    for audio_sample, segment in zip(synthesized_audios, segments):
+        start_idx = int(segment.time_range.start_seconds * sample_rate)
+        for i, sample in enumerate(audio_sample.samples):
+            target_idx = start_idx + i
+            if target_idx < total_samples:
+                full_audio_list[target_idx] = sample
+
+    full_audio = AudioSample(
+        samples=tuple(full_audio_list),
+        sample_rate=sample_rate
+    )
+
+    return AudioTrack(full_audio, language)
+
+
+# ============== 字幕缓存辅助函数 ============== #
 def _load_subtitle_segments(
         cached_data: dict,
         language: LanguageCode,
@@ -117,34 +205,6 @@ def _reconstruct_subtitles_from_cache(
 
     return original_subtitle, target_subtitle, secondary_subtitle
 
-
-def _serialize_segments(segments: tuple[TextSegment, ...]) -> list:
-    """序列化文本片段为字典列表"""
-    return [
-        {
-            "text": seg.text,
-            "start": seg.time_range.start_seconds,
-            "end": seg.time_range.end_seconds
-        }
-        for seg in segments
-    ]
-
-
-def _deserialize_segments(data: List[dict], language: LanguageCode) -> Tuple[TextSegment, ...]:
-    """把缓存里的 dict 列表还原成 TextSegment 元组。"""
-    return tuple(
-        TextSegment(
-            text=item["text"],
-            time_range=TimeRange(
-                start_seconds=item["start"],
-                end_seconds=item["end"],
-            ),
-            language=language
-        )
-        for item in data
-    )
-
-
 # ============== 字幕翻译策略函数 ============== #
 
 def _translate_subtitles(
@@ -191,192 +251,6 @@ def _translate_subtitles(
 
     return target_subtitle, secondary_subtitle
 
-
-# ============== 音频处理辅助函数 ============== #
-
-def _load_audio_from_cache(
-        cache_repo: CacheRepository,
-        cache_key: str,
-        video_name: str,
-        language: LanguageCode
-) -> Optional[AudioTrack]:
-    """从缓存加载音频轨道"""
-    try:
-        cached = cache_repo.get(cache_key)
-        if cached is None:
-            return None
-
-        # 优先从音频文件加载
-        if "audio_file" in cached:
-            audio_file = Path(cached["audio_file"])
-            if audio_file.exists():
-                try:
-                    import numpy as np
-                    import soundfile as sf
-
-                    audio_data, sample_rate = sf.read(str(audio_file))
-                    audio_sample = AudioSample(
-                        samples=tuple(audio_data.tolist()),
-                        sample_rate=sample_rate
-                    )
-                    audio_track = AudioTrack(audio_sample, language)
-                    print(f"  💾 音频缓存命中（文件）: {video_name}")
-                    return audio_track
-                except Exception as e:
-                    print(f"  ⚠️  音频文件加载失败: {e}")
-                    return None
-
-        # 兼容旧格式：从内存加载
-        if "audio_samples" in cached and "sample_rate" in cached:
-            audio_sample = AudioSample(
-                samples=tuple(cached["audio_samples"]),
-                sample_rate=cached["sample_rate"]
-            )
-            audio_track = AudioTrack(audio_sample, language)
-            print(f"  💾 音频缓存命中（内存）: {video_name}")
-            return audio_track
-
-        return None
-
-    except (KeyError, TypeError) as e:
-        print(f"  ⚠️  音频缓存解析失败: {e}")
-        return None
-
-
-def _assemble_full_audio(
-        synthesized_audios: tuple,
-        segments: tuple[TextSegment, ...],
-        video_duration: float,
-        language: LanguageCode
-) -> AudioTrack:
-    """将批量合成的音频片段拼接成完整音频"""
-    sample_rate = synthesized_audios[0].sample_rate
-    total_samples = int(video_duration * sample_rate)
-    full_audio_list = [0.0] * total_samples
-
-    for audio_sample, segment in zip(synthesized_audios, segments):
-        start_idx = int(segment.time_range.start_seconds * sample_rate)
-        for i, sample in enumerate(audio_sample.samples):
-            target_idx = start_idx + i
-            if target_idx < total_samples:
-                full_audio_list[target_idx] = sample
-
-    full_audio = AudioSample(
-        samples=tuple(full_audio_list),
-        sample_rate=sample_rate
-    )
-
-    return AudioTrack(full_audio, language)
-
-
-def _save_audio_to_cache(
-        cache_repo: CacheRepository,
-        cache_key: str,
-        audio_track: AudioTrack,
-        reference_audio_path: Path,
-        video_path: Path
-) -> None:
-    """保存音频到缓存（文件存储）"""
-    cache_dir = video_path.parent / ".audio_cache"
-    cache_dir.mkdir(exist_ok=True)
-
-    audio_cache_path = cache_dir / f"audio_{cache_key[:16]}.wav"
-
-    try:
-        import numpy as np
-        import soundfile as sf
-
-        audio_data = np.array(audio_track.audio.samples, dtype=np.float32)
-        sf.write(str(audio_cache_path), audio_data, audio_track.audio.sample_rate)
-
-        cache_data = {
-            "audio_file": str(audio_cache_path),
-            "sample_rate": audio_track.audio.sample_rate,
-            "language": audio_track.language.value,
-            "reference_audio": str(reference_audio_path),
-            "reference_duration": 10.0
-        }
-
-        cache_repo.set(cache_key, cache_data)
-        print(f"  💾 音频已保存到文件: {audio_cache_path.name}")
-
-    except Exception as e:
-        print(f"  ⚠️  音频缓存保存失败: {e}")
-        cache_data = {
-            "audio_samples": list(audio_track.audio.samples),
-            "sample_rate": audio_track.audio.sample_rate,
-            "language": audio_track.language.value,
-            "reference_audio": str(reference_audio_path),
-            "reference_duration": 10.0
-        }
-        cache_repo.set(cache_key, cache_data)
-
-
-def _batch_synthesize_segments(
-        vs: VideoWithSubtitles,
-        tts_provider: TTSProvider,
-        video_processor: VideoProcessor,
-        reference_audio_file: Path,
-        cache_repo: CacheRepository,
-        cache_key: str
-) -> AudioTrack:
-    """批量合成音频片段（使用中文字幕）"""
-
-    reference_audio_path = reference_audio_file
-    # video_processor.extract_reference_audio(vs.video, duration=10.0)
-
-    # ✅ 使用目标语言（中文）字幕
-    segments = vs.target_subtitle.segments
-    texts = [segment.text for segment in segments]
-
-    print(f"  🎤 批量合成中文配音: {len(texts)} 个片段")
-
-    # 批量合成
-    synthesized_audios = tts_provider.batch_synthesize(texts=texts, reference_audio_path=reference_audio_path,
-                                                       language=vs.target_subtitle.language)
-
-    # 拼接完整音频
-    audio_track = _assemble_full_audio(
-        synthesized_audios=synthesized_audios,
-        segments=segments,
-        video_duration=vs.video.duration,
-        language=vs.target_subtitle.language
-    )
-
-    # 保存缓存
-    _save_audio_to_cache(
-        cache_repo=cache_repo,
-        cache_key=cache_key,
-        audio_track=audio_track,
-        reference_audio_path=reference_audio_path,
-        video_path=vs.video.path
-    )
-
-    return audio_track
-
-
-def _skip_voice_cloning(
-        video_subtitles: tuple[VideoWithSubtitles, ...],
-        progress: Optional[Callable[[float, str], None]]
-) -> tuple[VideoWithAudio, ...]:
-    """跳过语音克隆"""
-    results = tuple(
-        VideoWithAudio(
-            video=vs.video,
-            original_subtitle=vs.original_subtitle,
-            target_subtitle=vs.target_subtitle,
-            secondary_subtitle=vs.secondary_subtitle,
-            detected_language=vs.detected_language,
-            audio_track=None,
-            cache_hit_audio=False
-        )
-        for vs in video_subtitles
-    )
-    if progress:
-        progress(1.0, "阶段2跳过: 未启用语音克隆")
-    return results
-
-
 # ============== 阶段性处理函数 ============== #
 def phase1_extract_asr(
         videos: List[Video],
@@ -422,11 +296,6 @@ def phase1_extract_asr(
         print(f"  ✅ Phase-1 完成: {video.path.name}  ({detected_lang.value})")
 
     return tuple(out)
-
-
-from typing import List, Optional, Tuple
-from tqdm import tqdm  # 可选，进度条更漂亮
-
 
 def phase2_translate(
         videos: List[Video],
@@ -545,18 +414,16 @@ def stage1_batch_asr(
 
 
 def stage2_batch_tts(
-        video_subtitles: tuple[VideoWithSubtitles, ...],
+        video_subtitles: tuple,
         tts_provider: TTSProvider,
         video_processor: VideoProcessor,
         cache_repo: CacheRepository,
+        audio_repo: AudioFileRepository,  # ✅ 新增参数
         enable_voice_cloning: bool = True,
         reference_audio_file: Path = None,
         progress: Optional[Callable[[float, str], None]] = None
-) -> tuple[VideoWithAudio, ...]:
-    """阶段2: 批量 TTS（使用中文字幕）"""
-
-    if progress:
-        progress(0.0, "阶段2: 批量语音克隆")
+) -> tuple:
+    """阶段2: 批量TTS（重构版）"""
 
     if not enable_voice_cloning:
         return _skip_voice_cloning(video_subtitles, progress)
@@ -566,43 +433,56 @@ def stage2_batch_tts(
 
     for idx, vs in enumerate(video_subtitles):
         if progress:
-            progress(idx / total, f"TTS: 处理视频 {idx + 1}/{total} - {vs.video.path.name}")
+            progress(idx / total, f"TTS: {idx + 1}/{total} - {vs.video.path.name}")
 
-        # ✅ 使用目标语言（中文）字幕
         cache_key = calculate_cache_key(
             vs.video.path,
             "voice_cloning",
             {
                 "language": vs.target_subtitle.language.value,
-                "reference": "auto",
                 "num_segments": len(vs.target_subtitle.segments)
             }
         )
 
-        cache_hit = cache_repo.exists(cache_key)
+        # ✅ 使用Port接口检查缓存
+        cache_hit = audio_repo.exists(cache_key)
         audio_track = None
 
         if cache_hit:
             audio_track = _load_audio_from_cache(
-                cache_repo,
+                audio_repo,
                 cache_key,
-                vs.video.path.name,
                 vs.target_subtitle.language
             )
             if audio_track is None:
                 cache_hit = False
 
         if not cache_hit:
-            audio_track = _batch_synthesize_segments(
-                vs=vs,
-                tts_provider=tts_provider,
-                video_processor=video_processor,
-                reference_audio_file=reference_audio_file,
-                cache_repo=cache_repo,
-                cache_key=cache_key
+            # 批量合成
+            texts = [seg.text for seg in vs.target_subtitle.segments]
+            synthesized_audios = tts_provider.batch_synthesize(
+                texts=texts,
+                reference_audio_path=reference_audio_file,
+                language=vs.target_subtitle.language
             )
-            print(f"  ✅ 完成: {vs.video.path.name}")
 
+            # 拼接音频
+            audio_track = _assemble_full_audio(
+                synthesized_audios=synthesized_audios,
+                segments=vs.target_subtitle.segments,
+                video_duration=vs.video.duration,
+                language=vs.target_subtitle.language
+            )
+
+            # ✅ 使用Port接口保存
+            _save_audio_to_cache(
+                audio_repo,
+                cache_key,
+                audio_track,
+                reference_audio_file
+            )
+
+        # 构建结果
         result = VideoWithAudio(
             video=vs.video,
             original_subtitle=vs.original_subtitle,
@@ -620,6 +500,27 @@ def stage2_batch_tts(
     tts_provider.unload()
     return tuple(results)
 
+
+def _skip_voice_cloning(video_subtitles, progress):
+    """跳过语音克隆的辅助函数"""
+
+    results = tuple(
+        VideoWithAudio(
+            video=vs.video,
+            original_subtitle=vs.original_subtitle,
+            target_subtitle=vs.target_subtitle,
+            secondary_subtitle=vs.secondary_subtitle,
+            detected_language=vs.detected_language,
+            audio_track=None,
+            cache_hit_audio=False
+        )
+        for vs in video_subtitles
+    )
+
+    if progress:
+        progress(1.0, "阶段2跳过: 未启用语音克隆")
+
+    return results
 
 def stage3_batch_synthesis(
         video_audios: tuple[VideoWithAudio, ...],
@@ -689,6 +590,7 @@ def batch_process_use_case(
         video_processor: VideoProcessor,
         subtitle_writer: SubtitleWriter,
         cache_repo: CacheRepository,
+        audio_repo: AudioFileRepository,
         output_dir: Path,
         enable_voice_cloning: bool = True,
         reference_audio_file: Path = None,
@@ -722,7 +624,7 @@ def batch_process_use_case(
     print(f"🎤 阶段2: 批量语音克隆")
     video_audios = stage2_batch_tts(
         video_subtitles, tts_provider, video_processor,
-        cache_repo, enable_voice_cloning, reference_audio_file,
+        cache_repo, audio_repo, enable_voice_cloning, reference_audio_file,
         lambda p, d: progress(0.4 + p * 0.4, d) if progress else None
     )
     print(f"✅ 阶段2完成\n")

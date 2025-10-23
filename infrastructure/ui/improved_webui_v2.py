@@ -14,15 +14,15 @@ from application.use_cases.incremental_voice_cloning import (
 )
 from domain.entities import (
     Video, Subtitle, LanguageCode,
-    TextSegment, TimeRange, AudioSegment,
+    AudioSegment,
     SegmentReviewStatus
 )
 from domain.services import calculate_cache_key
-from infrastructure.adapters.storage.audio_segment_repository_adapter import AudioSegmentRepositoryAdapter
 from infrastructure.config.dependency_injection import container
 
 # 初始化音频片段仓储
-audio_segment_repo = AudioSegmentRepositoryAdapter()
+audio_segment_repo = container.audio_segment_repo
+cache_service = container.cache_service
 
 
 # ============== 会话状态管理 V2 ============== #
@@ -104,18 +104,15 @@ def step1_generate_and_check_v2(
         source_language: str,
         progress=gr.Progress()
 ):
-    """步骤1: 生成字幕并进行质量检查"""
-    global current_session
-
+    """步骤1: 生成字幕（使用CacheService）"""
     if not video_file:
         return None, "❌ 请上传视频", gr.update(visible=False)
 
     try:
+        global current_session
         current_session = TranslationSessionV2()
 
         video_path = Path(video_file.name)
-
-        # 创建视频对象
         current_session.video = Video(
             path=video_path,
             duration=get_video_duration(video_path),
@@ -127,15 +124,38 @@ def step1_generate_and_check_v2(
             translation_context_name
         )
 
-        if not translation_context:
-            return None, f"❌ 无法加载翻译上下文: {translation_context_name}", gr.update(visible=False)
+        src_lang = _source_language_cache_format(source_language)
 
-        # 解析源语言
-        src_lang = LanguageCode(source_language) if source_language != "auto" else None
+        # ✅ 先尝试从缓存加载
+        progress(0.1, "检查缓存...")
+        cached_result = cache_service.load_subtitle_cache(
+            video_path=video_path,
+            source_language=src_lang,
+            context_domain=translation_context.domain if translation_context else None
+        )
 
-        progress(0.0, "开始生成字幕...")
+        if cached_result:
+            # 缓存命中
+            current_session.original_subtitle = cached_result["original_subtitle"]
+            current_session.translated_subtitle = cached_result["chinese_subtitle"]
+            current_session.english_subtitle = cached_result["english_subtitle"]
+            current_session.detected_language = cached_result["detected_language"]
 
-        # 使用改进的字幕生成用例
+            status_report = f"""
+✅ 字幕缓存命中
+
+📊 基本信息:
+   视频: {video_path.name}
+   检测语言: {cached_result['detected_language'].value}
+   总片段数: {len(cached_result['chinese_subtitle'].segments)}
+"""
+
+            review_data = _prepare_review_data_v2()
+            return review_data, status_report, gr.update(visible=True)
+
+        # 缓存未命中，执行完整生成流程
+        progress(0.2, "生成字幕...")
+
         from application.use_cases.improved_generate_subtitles import improved_generate_subtitles_use_case
 
         result = improved_generate_subtitles_use_case(
@@ -156,121 +176,29 @@ def step1_generate_and_check_v2(
         current_session.original_subtitle = result.original_subtitle
         current_session.translated_subtitle = result.translated_subtitle
         current_session.detected_language = result.detected_language
-        current_session.quality_report = result.quality_report
         current_session.translation_context = translation_context
         current_session.source_language = src_lang
 
-        src_lang = LanguageCode(
-            current_session.source_language.value) if current_session.source_language and current_session.source_language.value != "auto" else None
-
-        # 从缓存加载英文字幕
-        cache_params = {
-            "target_language": LanguageCode.CHINESE.value,
-            "source_language": src_lang
-        }
-
-        if translation_context:
-            cache_params["context_domain"] = translation_context.domain
-
-        cache_key = calculate_cache_key(
-            current_session.video.path,
-            "subtitles_v2",
-            cache_params
+        # ✅ 从缓存加载英文字幕（通过Service）
+        cached_result = cache_service.load_subtitle_cache(
+            video_path=video_path,
+            source_language=src_lang,
+            context_domain=translation_context.domain if translation_context else None
         )
 
-        try:
-            cached = container.cache_repo.get(cache_key)
-            if cached and "en_segments" in cached:
-                en_segments = tuple(
-                    TextSegment(
-                        text=seg["text"],
-                        time_range=TimeRange(seg["start"], seg["end"]),
-                        language=LanguageCode.ENGLISH
-                    )
-                    for seg in cached["en_segments"]
-                )
-                current_session.english_subtitle = Subtitle(en_segments, LanguageCode.ENGLISH)
-        except Exception as e:
-            print(f"  ⚠️  加载英文字幕失败: {e}")
+        if cached_result and cached_result["english_subtitle"]:
+            current_session.english_subtitle = cached_result["english_subtitle"]
 
-        # 🔧 关键修复1: 加载已缓存的音频片段
-        progress(0.95, "检查音频缓存...")
-        current_session.audio_segments = _load_cached_audio_segments(
-            current_session.video,
-            current_session.translated_subtitle
-        )
+        status_report = f"""
+✅ 字幕生成完成
 
-        # 🔧 关键修复1.5: 如果有缓存音频，尝试恢复参考音频路径
-        if current_session.audio_segments:
-            # 尝试从视频中提取参考音频（为后续编辑做准备）
-            try:
-                temp_ref_audio = container.video_processor.extract_reference_audio(
-                    current_session.video,
-                    duration=10.0
-                )
-                current_session.reference_audio_path = temp_ref_audio
-                print(f"  ✅ 已准备参考音频: {temp_ref_audio}")
-            except Exception as e:
-                print(f"  ⚠️  准备参考音频失败: {e}")
-                print(f"  💡 提示: 如需修改字幕，请先执行步骤2A获取参考音频")
+📊 基本信息:
+   视频: {video_path.name}
+   检测语言: {result.detected_language.value}
+   总片段数: {len(result.translated_subtitle.segments)}
+"""
 
-        # 初始化审核状态
-        for idx in range(len(result.translated_subtitle.segments)):
-            # 检查音频是否已缓存
-            audio_exists = idx in current_session.audio_segments
-
-            current_session.segment_review_status[idx] = SegmentReviewStatus(
-                segment_index=idx,
-                subtitle_approved=False,
-                audio_approved=audio_exists,  # 如果音频已缓存则标记为已完成
-                subtitle_modified=False,
-                needs_regeneration=not audio_exists  # 如果音频不存在则需要生成
-            )
-
-        # 生成状态报告
-        cached_audio_count = len(current_session.audio_segments)
-        total_segments = len(result.translated_subtitle.segments)
-
-        # 🆕 计算音频时长统计
-        total_max_duration = sum(seg.time_range.duration for seg in result.translated_subtitle.segments)
-        total_actual_duration = sum(
-            len(audio_seg.audio.samples) / audio_seg.audio.sample_rate
-            for audio_seg in current_session.audio_segments.values()
-        )
-
-        report_lines = [
-            f"✅ 字幕生成完成",
-            f"",
-            f"📊 基本信息:",
-            f"   视频: {current_session.video.path.name}",
-            f"   时长: {current_session.video.duration:.1f} 秒",
-            f"   检测语言: {result.detected_language.value}",
-            f"   总片段数: {total_segments}",
-            f"   使用上下文: {translation_context.domain}",
-            f"",
-            f"🎵 音频缓存状态:",
-            f"   已缓存片段: {cached_audio_count}/{total_segments}",
-            f"   需要生成: {total_segments - cached_audio_count}",
-            f"   理论总时长: {total_max_duration:.1f}s",
-            f"   已生成时长: {total_actual_duration:.1f}s",
-        ]
-
-        # 质量报告
-        if result.quality_report:
-            qr = result.quality_report
-            report_lines.extend([
-                f"",
-                f"🔍 质量检查结果:",
-                f"   整体质量: {qr.overall_quality}",
-                f"   发现问题: {qr.issues_found} 个",
-                f"   是否需要审核: {'是 ⚠️' if qr.requires_review else '否 ✅'}",
-            ])
-
-        status_report = "\n".join(report_lines)
-
-        # 准备审核数据(不包含音频)
         review_data = _prepare_review_data_v2()
-
         return review_data, status_report, gr.update(visible=True)
 
     except Exception as e:
@@ -279,8 +207,12 @@ def step1_generate_and_check_v2(
         return None, error_msg, gr.update(visible=False)
 
 
+def _source_language_cache_format(source_language: str) -> LanguageCode | None:
+    return LanguageCode(source_language) if source_language != "auto" else None
+
+
 def _prepare_review_data_v2():
-    """准备审核数据(包含音频播放器和时长信息)"""
+    """准备审核数据"""
     global current_session
 
     if not current_session.translated_subtitle:
@@ -291,35 +223,17 @@ def _prepare_review_data_v2():
             zip(current_session.original_subtitle.segments,
                 current_session.translated_subtitle.segments)
     ):
-        # 优先拿英文字幕
+        # 优先显示英文字幕
         en_text = (
             current_session.english_subtitle.segments[idx].text
-            if current_session.english_subtitle and idx < len(current_session.english_subtitle.segments)
+            if current_session.english_subtitle
+               and idx < len(current_session.english_subtitle.segments)
             else orig_seg.text
         )
 
-        # 问题标记
-        has_issue = False
-        issue_desc = ""
-        if current_session.quality_report:
-            segment_issues = [
-                i for i in current_session.quality_report.issues
-                if i.segment_index == idx
-            ]
-            if segment_issues:
-                has_issue = True
-                issue_desc = "; ".join([
-                    f"{i.issue_type}({i.severity})"
-                    for i in segment_issues
-                ])
-
-        # 🔧 计算时间片最大长度（秒）
-        max_duration = trans_seg.time_range.duration
-
-        # 🔧 计算已生成音频长度
+        # 音频状态
         audio_seg = current_session.audio_segments.get(idx)
         if audio_seg:
-            # 如果有音频，计算实际长度
             actual_duration = len(audio_seg.audio.samples) / audio_seg.audio.sample_rate
             audio_status = "✅ 已缓存"
             duration_str = f"{actual_duration:.2f}s"
@@ -327,28 +241,16 @@ def _prepare_review_data_v2():
             audio_status = "未生成"
             duration_str = "-"
 
-        # 审核状态
-        review_status = current_session.segment_review_status.get(idx)
-        if review_status:
-            if review_status.subtitle_approved and review_status.audio_approved:
-                review_mark = "✅ 已审核"
-            elif review_status.subtitle_modified:
-                review_mark = "🔄 已修改"
-            else:
-                review_mark = "⏳ 待审核"
-        else:
-            review_mark = "⏳ 待审核"
-
         data.append([
             idx,
             f"{trans_seg.time_range.start_seconds:.2f}s",
             en_text,
             trans_seg.text,
-            f"{max_duration:.2f}s",  # 🆕 最大长度
-            duration_str,  # 🆕 已生成长度
+            f"{trans_seg.time_range.duration:.2f}s",
+            duration_str,
             audio_status,
-            "⚠️" if has_issue else "",
-            review_mark
+            "",
+            "⏳ 待审核"
         ])
 
     return data
@@ -448,7 +350,7 @@ def step2_incremental_voice_cloning(
 
 # ============== 步骤2B: 字幕编辑和重新生成 ============== #
 def step2_save_edits_and_regenerate(review_dataframe):
-    """保存编辑并标记需要重新生成的片段"""
+    """保存编辑并标记需要重新生成的片段（使用CacheService）"""
     global current_session
 
     if hasattr(review_dataframe, "values"):
@@ -474,30 +376,37 @@ def step2_save_edits_and_regenerate(review_dataframe):
             continue
 
         original_text = current_session.translated_subtitle.segments[idx].text
-        edited_text = row[3]  # 翻译列
+        edited_text = row[3]
 
         if edited_text != original_text:
             current_session.edited_segments[idx] = edited_text
             current_session.modified_indices.add(idx)
             edited_count += 1
 
-            # 更新审核状态
-            status = current_session.segment_review_status.get(idx)
-            if status:
-                current_session.segment_review_status[idx] = status.mark_subtitle_modified()
-
     if edited_count:
-        # 应用编辑到字幕
+        # 应用编辑
         _apply_edits_to_subtitle_v2()
 
-        # 保存到缓存
-        _save_to_cache_v2("保存修改")
+        # ✅ 使用CacheService保存
+        cache_service.update_chinese_subtitle(
+            video_path=current_session.video.path,
+            updated_subtitle=current_session.translated_subtitle,
+            source_language=current_session.source_language,
+            context_domain=current_session.translation_context.domain
+            if current_session.translation_context else None
+        )
+
+        # ✅ 使下游缓存失效
+        cache_service.invalidate_downstream_caches(
+            video_path=current_session.video.path,
+            detected_language=current_session.detected_language
+        )
 
         updated_data = _prepare_review_data_v2()
 
         return (
-            f"✅ 已保存 {edited_count} 处修改\n"
-            f"⚠️  需要重新生成 {len(current_session.modified_indices)} 个音频片段",
+            f"✅ 已保存 {edited_count} 处修改（已同步到缓存）\n"
+            f"⚠️ 需要重新生成 {len(current_session.modified_indices)} 个音频片段",
             gr.update(value=updated_data)
         )
     else:
@@ -751,6 +660,8 @@ def _apply_edits_to_subtitle_v2():
     if not current_session.edited_segments:
         return
 
+    from domain.entities import TextSegment
+
     new_segments = []
     for idx, seg in enumerate(current_session.translated_subtitle.segments):
         if idx in current_session.edited_segments:
@@ -820,7 +731,6 @@ def get_video_duration(video_path: Path) -> float:
         str(video_path)
     ], capture_output=True, text=True)
     return float(result.stdout.strip())
-
 
 # ============== 步骤3: 最终合成 ============== #
 def step3_final_synthesis(progress=gr.Progress()):

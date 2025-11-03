@@ -47,6 +47,15 @@ class TranslationProvider(Protocol):
 class TTSProvider(ABC):
     """TTS 提供者接口"""
 
+    def update_config(self, temperature: float, top_p: float, speed: float, length_penalty: float) -> None:
+        """
+        更新配置
+
+        Args:
+            length_penalty: 长度惩罚系数
+        """
+        pass
+
     @abstractmethod
     def synthesize(
             self,
@@ -72,7 +81,8 @@ class TTSProvider(ABC):
             self,
             texts: list[str],
             reference_audio_path: Path,
-            language: LanguageCode
+            language: LanguageCode,
+            target_durations: Optional[list[float]] = None
     ) -> tuple[AudioSample, ...]:
         """
         批量合成（同一说话人）
@@ -86,7 +96,7 @@ class TTSProvider(ABC):
             texts: 待合成文本列表
             reference_audio_path: 参考音频路径
             language: 目标语言
-
+            target_durations: 目标时长列表（可选）
         Returns:
             合成的音频列表（顺序与输入一致）
         """

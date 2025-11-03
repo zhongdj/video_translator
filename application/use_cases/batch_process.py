@@ -26,6 +26,7 @@ from domain.services import (
     calculate_cache_key,
 )
 
+
 # ============== 中间数据结构 ============== #
 @dataclass(frozen=True)
 class VideoWithSubtitles:
@@ -71,8 +72,8 @@ def _serialize_segments(segments: tuple[TextSegment, ...]) -> list:
 
 
 def _deserialize_segments(
-    data: List[dict],
-    language: LanguageCode
+        data: List[dict],
+        language: LanguageCode
 ) -> Tuple[TextSegment, ...]:
     """反序列化文本片段"""
     return tuple(
@@ -205,6 +206,7 @@ def _reconstruct_subtitles_from_cache(
 
     return original_subtitle, target_subtitle, secondary_subtitle
 
+
 # ============== 字幕翻译策略函数 ============== #
 
 def _translate_subtitles(
@@ -251,6 +253,7 @@ def _translate_subtitles(
 
     return target_subtitle, secondary_subtitle
 
+
 # ============== 阶段性处理函数 ============== #
 def phase1_extract_asr(
         videos: List[Video],
@@ -296,6 +299,7 @@ def phase1_extract_asr(
         print(f"  ✅ Phase-1 完成: {video.path.name}  ({detected_lang.value})")
 
     return tuple(out)
+
 
 def phase2_translate(
         videos: List[Video],
@@ -429,6 +433,7 @@ def stage2_batch_tts(
         return _skip_voice_cloning(video_subtitles, progress)
 
     results = []
+    target_durations = []
     total = len(video_subtitles)
 
     for idx, vs in enumerate(video_subtitles):
@@ -443,6 +448,7 @@ def stage2_batch_tts(
                 "num_segments": len(vs.target_subtitle.segments)
             }
         )
+        target_durations.append(vs.video.duration)
 
         # ✅ 使用Port接口检查缓存
         cache_hit = audio_repo.exists(cache_key)
@@ -463,7 +469,8 @@ def stage2_batch_tts(
             synthesized_audios = tts_provider.batch_synthesize(
                 texts=texts,
                 reference_audio_path=reference_audio_file,
-                language=vs.target_subtitle.language
+                language=vs.target_subtitle.language,
+                target_durations=target_durations
             )
 
             # 拼接音频
@@ -521,6 +528,7 @@ def _skip_voice_cloning(video_subtitles, progress):
         progress(1.0, "阶段2跳过: 未启用语音克隆")
 
     return results
+
 
 def stage3_batch_synthesis(
         video_audios: tuple[VideoWithAudio, ...],

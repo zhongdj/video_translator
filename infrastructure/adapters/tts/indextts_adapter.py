@@ -12,6 +12,8 @@ from domain.ports import TTSProvider
 class IndexTTSAdapter(TTSProvider):
     """IndexTTS2 适配器 - 修复版"""
 
+
+
     def __init__(self, model_path: Optional[str] = None, device: str = "cuda"):
         self.enable_auto_recovery = True
         self.default_batch_size = 16
@@ -194,6 +196,7 @@ class IndexTTSAdapter(TTSProvider):
                             key=lambda x: abs(x - speed))
         return self.speed_mapping[closest_speed]
 
+
     def synthesize(
             self,
             text: str,
@@ -212,7 +215,8 @@ class IndexTTSAdapter(TTSProvider):
                 reference_audio_path=voice_profile.reference_audio_path,
                 language=voice_profile.language,
                 batch_size=8,
-                speed_factor=1.0  # 明确传递速度
+                speed_factor=1.0,  # 明确传递速度
+                target_durations=[target_duration],
             )
             audio = results[0]
             actual_duration = len(audio.samples) / audio.sample_rate
@@ -231,7 +235,8 @@ class IndexTTSAdapter(TTSProvider):
                     reference_audio_path=voice_profile.reference_audio_path,
                     language=voice_profile.language,
                     batch_size=8,
-                    speed_factor=adjusted_speed  # 传递调整后的速度
+                    speed_factor=adjusted_speed,
+                    target_durations=[target_duration],
                 )
 
             return results[0]
@@ -285,7 +290,8 @@ class IndexTTSAdapter(TTSProvider):
             reference_audio_path: Path,
             language: LanguageCode,
             batch_size: Optional[int] = None,
-            speed_factor: float = 1.0  # 🔥 新增速度参数
+            speed_factor: float = 1.0,  # 🔥 新增速度参数
+            target_durations: Optional[list[float]] = None  # ✅ 新增
     ) -> tuple[AudioSample, ...]:
         """
         批量合成(自适应 batch_size)
@@ -303,7 +309,8 @@ class IndexTTSAdapter(TTSProvider):
             return self._batch_synthesize_with_recovery(
                 texts=texts,
                 reference_audio_path=reference_audio_path,
-                speed_factor=speed_factor  # 🔥 传递速度参数
+                speed_factor=speed_factor,  # 🔥 传递速度参数
+                target_durations=target_durations
             )
         except Exception as e:
             print(f"❌ 批量合成失败: {e}")
@@ -313,14 +320,16 @@ class IndexTTSAdapter(TTSProvider):
             self,
             texts: list[str],
             reference_audio_path: Path,
-            speed_factor: float = 1.0  # 🔥 新增参数
+            speed_factor: float = 1.0,  # 🔥 新增参数
+            target_durations: Optional[list[float]] = None  # ✅
     ) -> tuple[AudioSample, ...]:
         """带 OOM 自动恢复的批量合成"""
         try:
             return self._do_batch_synthesize(
                 texts=texts,
                 reference_audio_path=reference_audio_path,
-                speed_factor=speed_factor  # 🔥 传递参数
+                speed_factor=speed_factor,  # 🔥 传递参数
+                target_durations=target_durations  # ✅
             )
         except RuntimeError as e:
             if "out of memory" in str(e).lower() and self.enable_auto_recovery:
@@ -333,9 +342,10 @@ class IndexTTSAdapter(TTSProvider):
             self,
             texts: list[str],
             reference_audio_path: Path,
-            speed_factor: float = 1.0  # 🔥 新增参数
+            speed_factor: float = 1.0,
+            target_durations: Optional[list[float]] = None  # (每条 text 对应目标秒数)
     ) -> tuple[AudioSample, ...]:
-        """实际执行批量合成"""
+        """实际执行批量合成（按条计算每条的 max_text_tokens_per_segment & max_mel_tokens）"""
         print(f"  ⚠️  reference audio path: {str(reference_audio_path)}")
         print(f"  ⚡ speed factor: {speed_factor}x")
 
@@ -347,67 +357,96 @@ class IndexTTSAdapter(TTSProvider):
         speed_index = self._speed_to_index(speed_factor)
         print(f"  📊 speed_index={speed_index} (mapped from {speed_factor}x)")
 
-        # 🔥 关键修复:调用 batch_infer_same_speaker,传递速度参数
-        batch_results = self.model.batch_infer_same_speaker(
-            texts=texts,
-            spk_audio_prompt=str(reference_audio_path),
-            output_paths=None,
-            emo_audio_prompt=None,
-            emo_alpha=1.0,
-            interval_silence=0,
-            verbose=True,
-            max_text_tokens_per_segment=120,
-            speed_index=speed_index,  # 🔥 传递速度索引
-            # generation_kwargs
-            do_sample=True,
-            top_p=self.top_p,
-            top_k=30,
-            temperature=self.temperature,
-            length_penalty=0.0,
-            num_beams=3,
-            repetition_penalty=10.0,
-            max_mel_tokens=1500
-        )
+        # 估算参数的基准值（可调整或改成从 token_calculator 导入）
+        token_per_sec = 12.8
+        mel_per_sec = 55
+        margin = 1.05  # 稍微放宽一点，避免截断
 
+        def estimate_text_tokens(sec):
+            if sec is None:
+                return min(self.split_max_tokens, 120)
+            val = int(sec * token_per_sec * margin)
+            val = max(20, val)
+            return min(val, int(self.split_max_tokens))
+
+        def estimate_mel_tokens(sec):
+            if sec is None:
+                return int(self.max_mel_tokens)
+            val = int(sec * mel_per_sec * margin)
+            val = max(50, val)
+            return min(val, int(self.max_mel_tokens))
+
+        # 如果给了 target_durations 长度校验
+        if target_durations and len(target_durations) != len(texts):
+            raise ValueError("target_durations length must equal texts length")
+
+        # 逐条合成（如果底层支持批量传入 per-item 参数，可改为一次性传入 list）
+        for idx, text in enumerate(texts):
+            tgt_sec = None
+            if target_durations:
+                tgt_sec = target_durations[idx]
+
+            max_text_tokens_per_segment = 120 #estimate_text_tokens(tgt_sec)
+            max_mel_tokens = 1500 #estimate_mel_tokens(tgt_sec)
+
+            print(
+                f"  ▶ [{idx}] tgt_sec={tgt_sec} -> max_text_tokens_per_segment={max_text_tokens_per_segment}, max_mel_tokens={max_mel_tokens}")
+
+            # 调用底层（单条或小批量模式）
+            results = self.model.batch_infer_same_speaker(
+                texts=[text],
+                spk_audio_prompt=str(reference_audio_path),
+                output_paths=None,
+                emo_audio_prompt=None,
+                emo_alpha=1.0,
+                interval_silence=0,
+                verbose=True,
+                max_text_tokens_per_segment=max_text_tokens_per_segment,
+                speed_index=speed_index,
+                # generation kwargs
+                do_sample=self.gpt_config.get('do_sample', True),
+                top_p=self.top_p,
+                top_k=self.gpt_config.get('top_k', 30),
+                temperature=self.temperature,
+                length_penalty=self.gpt_config.get('length_penalty', 0.0),
+                num_beams=self.gpt_config.get('num_beams', 3),
+                repetition_penalty=10.0,
+                max_mel_tokens=max_mel_tokens
+            )
+
+            # 处理返回值（batch_infer_same_speaker 返回的可能是 list/tuple）
+            if not results:
+                print(f"⚠️ [{idx}] 无返回结果")
+                continue
+
+            # 取第一个结果（因为我们传入单条 text）
+            sampling_rate, wav_data = results[0]
+            if wav_data.ndim == 2:
+                wav = wav_data[:, 0]
+            else:
+                wav = wav_data
+
+            wav_float = wav.astype(np.float32) / 32767.0
+            audio_sample = AudioSample(samples=tuple(float(s) for s in wav_float), sample_rate=sampling_rate)
+
+            # 打印实际时长用于调试与二次调整参考
+            actual_dur = len(audio_sample.samples) / audio_sample.sample_rate
+            if tgt_sec is not None:
+                diff = actual_dur - tgt_sec
+                print(f"    ⏱ 实际时长: {actual_dur:.3f}s (目标 {tgt_sec:.3f}s, 偏差 {diff:+.3f}s)")
+            else:
+                print(f"    ⏱ 实际时长: {actual_dur:.3f}s")
+
+            all_audio_samples.append(audio_sample)
+
+        # 统计与缓存清理
         iter_time = time.perf_counter() - batch_start_time
-
-        # 记录内存峰值
         if torch.cuda.is_available():
             peak_memory = torch.cuda.max_memory_allocated() / 1e9
             self.stats["peak_memory_gb"] = max(self.stats["peak_memory_gb"], peak_memory)
-            print(f" ✓ {iter_time:.2f}秒 (GPU: {peak_memory:.1f}GB, speed: {speed_factor}x)")
+            print(f" ✓ {iter_time:.2f}s (GPU: {peak_memory:.1f}GB)")
         else:
-            print(f" ✓ {iter_time:.2f}秒 (speed: {speed_factor}x)")
-
-        # 处理返回值
-        for result in batch_results:
-            if isinstance(result, tuple) and len(result) == 2:
-                sampling_rate, wav_data = result
-
-                if wav_data.ndim == 2:
-                    wav_data = wav_data[:, 0]
-                elif wav_data.ndim == 1:
-                    pass
-                else:
-                    print(f"⚠️ 未预期的音频维度: {wav_data.shape}")
-                    wav_data = wav_data.flatten()
-
-                # 转换为 float32 格式
-                wav_float = wav_data.astype(np.float32) / 32767.0
-
-                audio_sample = AudioSample(
-                    samples=tuple(float(s) for s in wav_float),
-                    sample_rate=sampling_rate
-                )
-                all_audio_samples.append(audio_sample)
-            else:
-                print(f"⚠️ 未预期的返回格式: {type(result)}")
-                continue
-
-        # 清理缓存
-        del batch_results
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            print(f" ✓ {iter_time:.2f}s")
 
         # 更新统计
         total_time = time.perf_counter() - batch_start_time
@@ -415,19 +454,21 @@ class IndexTTSAdapter(TTSProvider):
         self.stats["total_batches"] += 1
         self.stats["total_time"] += total_time
 
-        avg_time = total_time / total_texts
-        print(f"  ✅ 完成: {total_texts} 个片段, 总耗时 {total_time:.2f}秒 (平均 {avg_time:.3f}秒/片段)")
+        avg_time = total_time / max(1, total_texts)
+        print(f"  ✅ 完成: {total_texts} 个片段, 总耗时 {total_time:.2f}s (平均 {avg_time:.3f}s/片段)")
 
         return tuple(all_audio_samples)
 
-    def update_config(self, temperature: float = None, top_p: float = None, speed: float = None):
+    def update_config(self, temperature: float = None, top_p: float = None, speed: float = None, length_penalty: float = None) -> None :
         """更新配置参数"""
-        if temperature is not None:
+        if temperature is not None and temperature > 0:
             self.temperature = temperature
             self.gpt_config['temperature'] = temperature
-        if top_p is not None:
+        if top_p is not None and 0 < top_p <= 1:
             self.top_p = top_p
             self.gpt_config['top_p'] = top_p
-        if speed is not None:
+        if speed is not None and speed > 0:
             self.speed = speed
+        if length_penalty is not None:
+            self.gpt_config['length_penalty'] = length_penalty
 

@@ -47,6 +47,11 @@ class TranslationSessionV2:
         self.modified_indices: set[int] = set()
         self.reference_audio_path: Optional[Path] = None
         self.approved = False
+        # ✅ 新增：TTS 配置
+        self.length_penalty: float = 0.0  # length_penalty 参数
+
+        # ✅ 新增：时长统计
+        self.duration_stats: Dict[int, dict] = {}  # {idx: {target, actual, error, ratio}}
 
 
 current_session = TranslationSessionV2()
@@ -445,74 +450,328 @@ def step2_save_edits_and_regenerate(review_dataframe):
         return "ℹ️ 未检测到修改", gr.update()
 
 
-# ============== 步骤2C: 重新生成 ============== #
+# ============== ✅ 新增：时长分析工具 ============== #
 
-def step2_regenerate_modified():
-    """重新生成修改过的片段（修复版）"""
-    global current_session
+def calculate_duration_statistics() -> dict:
+    """
+    计算时长统计数据
 
-    if not current_session.modified_indices:
-        return "ℹ️ 没有需要重新生成的片段", gr.update()
+    Returns:
+        {
+            "total_segments": int,
+            "analyzed_segments": int,
+            "avg_error": float,
+            "max_error": float,
+            "over_limit_count": int,
+            "over_limit_indices": list[int]
+        }
+    """
+    if not current_session.translated_subtitle:
+        return {
+            "total_segments": 0,
+            "analyzed_segments": 0,
+            "avg_error": 0.0,
+            "max_error": 0.0,
+            "over_limit_count": 0,
+            "over_limit_indices": []
+        }
 
-    # ✅ 修复: 智能获取参考音频
-    ref_audio_path = None
+    total = len(current_session.translated_subtitle.segments)
+    analyzed = 0
+    errors = []
+    over_limit_indices = []
 
-    # 1. 优先使用会话中的路径
-    if current_session.reference_audio_path and current_session.reference_audio_path.exists():
-        ref_audio_path = current_session.reference_audio_path
-        print(f"📁 使用会话中的参考音频: {ref_audio_path}")
+    for idx, text_seg in enumerate(current_session.translated_subtitle.segments):
+        audio_seg = current_session.audio_segments.get(idx)
 
-    # 2. 尝试从仓储加载
-    else:
-        ref_audio_path = audio_file_repo.load_reference_audio(current_session.video.path)
-        if ref_audio_path and ref_audio_path.exists():
-            current_session.reference_audio_path = ref_audio_path
-            print(f"📁 从仓储加载参考音频: {ref_audio_path}")
+        if audio_seg:
+            target_duration = text_seg.time_range.duration
+            actual_duration = len(audio_seg.audio.samples) / audio_seg.audio.sample_rate
+            error = actual_duration - target_duration
+            ratio = actual_duration / target_duration if target_duration > 0 else 0
 
-    # 3. 都失败了，提示用户
-    if not ref_audio_path:
-        return (
-            "❌ 错误: 缺少参考音频\n\n"
-            "💡 解决方案:\n"
-            "   1. 重新执行步骤2A\n"
-            "   2. 上传参考音频或让系统从视频提取",
-            gr.update()
+            # 保存统计
+            current_session.duration_stats[idx] = {
+                "target": target_duration,
+                "actual": actual_duration,
+                "error": error,
+                "ratio": ratio
+            }
+
+            analyzed += 1
+            errors.append(abs(error))
+
+            # 检查是否超限（超过目标时长）
+            if error > 0.1:  # 超过 0.1 秒算超限
+                over_limit_indices.append(idx)
+
+    avg_error = sum(errors) / len(errors) if errors else 0.0
+    max_error = max(errors) if errors else 0.0
+
+    return {
+        "total_segments": total,
+        "analyzed_segments": analyzed,
+        "avg_error": avg_error,
+        "max_error": max_error,
+        "over_limit_count": len(over_limit_indices),
+        "over_limit_indices": over_limit_indices
+    }
+
+
+def _prepare_review_data_v2(filter_over_limit: bool = False):
+    """
+    准备审核数据（支持筛选）
+
+    Args:
+        filter_over_limit: 是否只显示超限片段
+    """
+    if not current_session.translated_subtitle:
+        return None
+
+    data = []
+    for idx, (orig_seg, trans_seg) in enumerate(
+            zip(current_session.original_subtitle.segments,
+                current_session.translated_subtitle.segments)
+    ):
+        # 获取英文字幕
+        en_text = (
+            current_session.english_subtitle.segments[idx].text
+            if current_session.english_subtitle
+               and idx < len(current_session.english_subtitle.segments)
+            else orig_seg.text
         )
 
-    try:
-        print(f"\n🔄 重新生成修改片段:")
-        print(f"   修改片段数: {len(current_session.modified_indices)}")
-        print(f"   参考音频: {ref_audio_path}")
+        # 获取音频信息
+        audio_seg = current_session.audio_segments.get(idx)
+        target_duration = trans_seg.time_range.duration
 
-        result = regenerate_modified_segments_use_case(
+        if audio_seg:
+            actual_duration = len(audio_seg.audio.samples) / audio_seg.audio.sample_rate
+            duration_error = actual_duration - target_duration
+            duration_ratio = (actual_duration / target_duration * 100) if target_duration > 0 else 0
+
+            audio_status = "✅ 已生成"
+            duration_str = f"{actual_duration:.2f}s"
+
+            # ✅ 时长状态标记
+            if duration_error > 0.5:
+                duration_status = f"⚠️ 超时 {duration_error:.2f}s ({duration_ratio:.0f}%)"
+            elif duration_error > 0.1:
+                duration_status = f"⚡ 略超 {duration_error:.2f}s ({duration_ratio:.0f}%)"
+            elif duration_error < -0.5:
+                duration_status = f"📉 过短 {duration_error:.2f}s ({duration_ratio:.0f}%)"
+            else:
+                duration_status = f"✅ 正常 ({duration_ratio:.0f}%)"
+
+            # ✅ 筛选逻辑
+            if filter_over_limit and duration_error <= 0.1:
+                continue  # 跳过正常片段
+        else:
+            audio_status = "未生成"
+            duration_str = "-"
+            duration_status = "⏳ 待生成"
+
+            if filter_over_limit:
+                continue  # 跳过未生成片段
+
+        data.append([
+            idx,
+            f"{trans_seg.time_range.start_seconds:.2f}s",
+            en_text,
+            trans_seg.text,
+            f"{target_duration:.2f}s",
+            duration_str,
+            duration_status,
+            audio_status,
+            "⏳ 待审核"
+        ])
+
+    return data
+# ============== ✅ 新增：时长统计面板 ============== #
+
+def show_duration_statistics():
+    """显示时长统计信息"""
+    stats = calculate_duration_statistics()
+
+    if stats["total_segments"] == 0:
+        return "📊 暂无数据", gr.update(visible=False)
+
+    analyzed_ratio = stats["analyzed_segments"] / stats["total_segments"] * 100
+
+    report = f"""
+📊 时长统计报告
+
+**总体情况:**
+   • 总片段数: {stats['total_segments']}
+   • 已生成: {stats['analyzed_segments']} ({analyzed_ratio:.1f}%)
+   • 待生成: {stats['total_segments'] - stats['analyzed_segments']}
+
+**时长精度:**
+   • 平均误差: {stats['avg_error']:.3f}s
+   • 最大误差: {stats['max_error']:.3f}s
+   • 超限片段: {stats['over_limit_count']} 个
+
+**建议:**
+"""
+
+    if stats['avg_error'] < 0.1:
+        report += "   ✅ 时长控制优秀！"
+    elif stats['avg_error'] < 0.3:
+        report += "   ✅ 时长控制良好"
+    elif stats['avg_error'] < 0.5:
+        report += "   ⚠️  时长误差较大，建议调整 length_penalty"
+    else:
+        report += "   ❌ 时长严重超限，请调整 length_penalty 并重新生成"
+
+    if stats['over_limit_count'] > 0:
+        report += f"\n   💡 发现 {stats['over_limit_count']} 个超限片段，可使用筛选功能查看"
+
+    return report, gr.update(visible=True)
+
+
+# ============== ✅ 新增：length_penalty 调节功能 ============== #
+
+def update_length_penalty(length_penalty_value: float):
+    """更新 length_penalty 参数"""
+    current_session.length_penalty = length_penalty_value
+
+    # 更新到 TTS Provider
+    tts = container.get_tts()
+    if hasattr(tts, 'update_config'):
+        tts.update_config(length_penalty=length_penalty_value)
+
+    return f"✅ length_penalty 已更新为 {length_penalty_value:.2f}"
+
+
+def suggest_length_penalty():
+    """根据统计数据推荐 length_penalty 值"""
+    stats = calculate_duration_statistics()
+
+    if stats['analyzed_segments'] == 0:
+        return 0.0, "⚠️ 暂无统计数据，使用默认值 0.0"
+
+    avg_error = stats['avg_error']
+
+    # 推荐算法
+    if avg_error < 0.1:
+        suggested = 0.0
+        reason = "时长控制优秀，保持当前设置"
+    elif avg_error < 0.3:
+        suggested = 0.5
+        reason = "时长略有超限，建议使用轻微惩罚"
+    elif avg_error < 0.5:
+        suggested = 1.0
+        reason = "时长超限较多，建议使用中等惩罚"
+    else:
+        suggested = 1.5
+        reason = "时长严重超限，建议使用较强惩罚"
+
+    return suggested, f"💡 建议值: {suggested:.1f} ({reason})"
+# ============== 步骤2C: 重新生成 ============== #
+def step2_incremental_voice_cloning(
+        reference_audio_file,
+        ref_audio_duration: float,
+        ref_audio_start_offset: float,
+        length_penalty: float,  # ✅ 新增参数
+        progress=gr.Progress()
+):
+    """步骤2A: 增量语音克隆（支持 length_penalty）"""
+    global current_session
+
+    if not current_session.video or not current_session.translated_subtitle:
+        return "❌ 错误: 会话状态丢失", gr.update(), ""
+
+    try:
+        # ✅ 保存 length_penalty 到会话
+        current_session.length_penalty = length_penalty
+
+        # 准备参考音频（保持原有逻辑）
+        if reference_audio_file:
+            ref_audio_path = audio_file_repo.save_reference_audio(
+                video_path=current_session.video.path,
+                source_audio_path=Path(reference_audio_file.name)
+            )
+            current_session.reference_audio_path = ref_audio_path
+        else:
+            existing_ref_audio = audio_file_repo.load_reference_audio(
+                current_session.video.path
+            )
+            if existing_ref_audio and existing_ref_audio.exists():
+                ref_audio_path = existing_ref_audio
+            else:
+                temp_ref_audio = container.video_processor.extract_reference_audio(
+                    video=current_session.video,
+                    duration=ref_audio_duration,
+                    start_offset=ref_audio_start_offset
+                )
+                ref_audio_path = audio_file_repo.save_reference_audio(
+                    video_path=current_session.video.path,
+                    source_audio_path=temp_ref_audio
+                )
+                if temp_ref_audio.exists():
+                    temp_ref_audio.unlink()
+
+            current_session.reference_audio_path = ref_audio_path
+
+        # ✅ 更新 TTS 配置
+        tts = container.get_tts()
+        if hasattr(tts, 'update_config'):
+            tts.update_config(length_penalty)
+
+        print(f"  ⚙️  length_penalty: {length_penalty}")
+
+        # 实时进度回调
+        def segment_progress(ratio, msg, idx, audio_seg):
+            progress(ratio, msg)
+            if audio_seg:
+                current_session.audio_segments[idx] = audio_seg
+
+        # 执行增量合成
+        result = incremental_voice_cloning_use_case(
             video=current_session.video,
-            original_subtitle=current_session.original_subtitle,
-            modified_subtitle=current_session.translated_subtitle,
-            modified_indices=current_session.modified_indices,
+            subtitle=current_session.translated_subtitle,
             tts_provider=container.get_tts(),
             video_processor=container.video_processor,
             audio_repo=audio_segment_repo,
+            cache_repo=container.cache_repo,
             reference_audio_path=ref_audio_path,
-            progress=None
+            progress=segment_progress
         )
 
+        # 更新所有音频片段到会话
         for audio_seg in result.audio_segments:
             current_session.audio_segments[audio_seg.segment_index] = audio_seg
 
-        current_session.modified_indices.clear()
+        # ✅ 生成时长统计
+        stats_report, _ = show_duration_statistics()
 
-        updated_data = _prepare_review_data_v2()
+        status = f"""
+✅ 增量语音克隆完成!
 
-        return (
-            f"✅ 重新生成完成!\n"
-            f"   重新生成: {result.regenerated_segments} 个片段\n"
-            f"   耗时: {result.synthesis_time:.1f} 秒",
-            gr.update(value=updated_data)
-        )
+📊 合成统计:
+   总片段数: {result.total_segments}
+   缓存命中: {result.cached_segments}
+   新生成: {result.regenerated_segments}
+   耗时: {result.synthesis_time:.1f} 秒
+
+⚙️  配置参数:
+   length_penalty: {length_penalty}
+   参考音频: {ref_audio_path.name}
+
+{stats_report}
+
+💡 提示: 
+   - 点击 "显示时长统计" 查看详细分析
+   - 使用 "只看超限片段" 筛选问题片段
+"""
+
+        updated_data = _prepare_review_data_v2(filter_over_limit=False)
+        return status, gr.update(value=updated_data), stats_report
 
     except Exception as e:
         import traceback
-        return f"❌ 重新生成失败: {str(e)}\n{traceback.format_exc()}", gr.update()
+        error_msg = f"❌ 语音克隆失败: {str(e)}\n\n{traceback.format_exc()}"
+        return error_msg, gr.update(), ""
 
 
 # ============== 片段预览 ============== #
@@ -732,8 +991,84 @@ def step3_final_synthesis(
         return None, None, None, error_msg
 
 
-# ============== UI 构建 ============== #
+def toggle_filter_over_limit(filter_enabled: bool):
+    """切换超限片段筛选"""
+    updated_data = _prepare_review_data_v2(filter_over_limit=filter_enabled)
 
+    if filter_enabled:
+        stats = calculate_duration_statistics()
+        message = f"🔍 已筛选，显示 {stats['over_limit_count']} 个超限片段"
+    else:
+        message = "📋 显示全部片段"
+
+    return gr.update(value=updated_data), message
+
+
+def refresh_review_table(filter_enabled: bool):
+    """刷新审核表格"""
+    updated_data = _prepare_review_data_v2(filter_over_limit=filter_enabled)
+    stats_report, _ = show_duration_statistics()
+    return gr.update(value=updated_data), stats_report
+def step2_regenerate_modified(length_penalty: float):
+    """重新生成修改过的片段（支持 length_penalty）"""
+    global current_session
+
+    if not current_session.modified_indices:
+        return "ℹ️ 没有需要重新生成的片段", gr.update(), ""
+
+    ref_audio_path = current_session.reference_audio_path
+    if not ref_audio_path:
+        ref_audio_path = audio_file_repo.load_reference_audio(current_session.video.path)
+
+    if not ref_audio_path:
+        return "❌ 错误: 缺少参考音频", gr.update(), ""
+
+    try:
+        # ✅ 更新 length_penalty
+        tts = container.get_tts()
+        if hasattr(tts, 'update_config'):
+            tts.update_config(length_penalty=length_penalty)
+
+        print(f"  ⚙️  重新生成配置: length_penalty={length_penalty}")
+
+        result = regenerate_modified_segments_use_case(
+            video=current_session.video,
+            original_subtitle=current_session.original_subtitle,
+            modified_subtitle=current_session.translated_subtitle,
+            modified_indices=current_session.modified_indices,
+            tts_provider=container.get_tts(),
+            video_processor=container.video_processor,
+            audio_repo=audio_segment_repo,
+            reference_audio_path=ref_audio_path,
+            progress=None
+        )
+
+        for audio_seg in result.audio_segments:
+            current_session.audio_segments[audio_seg.segment_index] = audio_seg
+
+        current_session.modified_indices.clear()
+
+        # ✅ 更新统计
+        stats_report, _ = show_duration_statistics()
+        updated_data = _prepare_review_data_v2(filter_over_limit=False)
+
+        status = f"""
+✅ 重新生成完成!
+   重新生成: {result.regenerated_segments} 个片段
+   耗时: {result.synthesis_time:.1f} 秒
+   length_penalty: {length_penalty}
+
+{stats_report}
+"""
+
+        return status, gr.update(value=updated_data), stats_report
+
+    except Exception as e:
+        import traceback
+        return f"❌ 重新生成失败: {str(e)}\n{traceback.format_exc()}", gr.update(), ""
+
+
+# ============== UI 构建 ============== #
 def build_ui_v2():
     """构建增强 UI V2（完整重构版）"""
 
@@ -803,8 +1138,9 @@ def build_ui_v2():
                 gr.Markdown("""
                 ### 工作流程
                 1. **2A. 增量语音克隆**: 逐片段生成音频并缓存
-                2. **2B. 审核预览**: 试听音频,修改字幕
-                3. **2C. 重新生成**: 只重新生成修改过的片段
+                2. **📊 时长分析**: 查看统计和筛选超限片段
+                3. **2B. 审核预览**: 试听音频,修改字幕
+                4. **2C. 重新生成**: 调整 length_penalty 并重新生成
                 """)
 
                 # 2A: 语音克隆
@@ -812,32 +1148,68 @@ def build_ui_v2():
                     gr.Markdown("### 2A. 增量语音克隆")
 
                     reference_audio = gr.File(
-                        label="🎵 参考音频(可选，留空则从视频提取)",
+                        label="🎵 参考音频(可选)",
                         file_types=[".wav", ".mp3"]
                     )
 
-                    # ✅ 新增: 参考音频配置
                     with gr.Row():
                         ref_duration_slider = gr.Slider(
-                            minimum=5,
-                            maximum=60,
-                            value=10,
-                            step=5,
-                            label="⏱️ 参考音频时长（秒）",
-                            info="提取或使用的参考音频长度"
+                            minimum=5, maximum=60, value=10, step=5,
+                            label="⏱️ 参考音频时长（秒）"
+                        )
+                        ref_offset_slider = gr.Slider(
+                            minimum=0, maximum=120, value=0, step=5,
+                            label="📍 起始偏移（秒）"
                         )
 
-                        ref_offset_slider = gr.Slider(
-                            minimum=0,
-                            maximum=120,
-                            value=0,
-                            step=5,
-                            label="📍 起始偏移（秒）",
-                            info="从视频的第几秒开始提取，0表示从头开始（或使用VAD检测）"
+                    # ✅ length_penalty 控制
+                    with gr.Row():
+                        length_penalty_slider = gr.Slider(
+                            minimum=-2.0,
+                            maximum=2.0,
+                            value=0.0,
+                            step=0.1,
+                            label="⚙️ length_penalty",
+                            info="负值鼓励更长输出，正值鼓励更短输出（默认0.0）"
                         )
+                        suggest_penalty_btn = gr.Button(
+                            "💡 智能推荐",
+                            size="sm",
+                            variant="secondary"
+                        )
+
+                    length_penalty_status = gr.Textbox(
+                        label="length_penalty 状态",
+                        lines=2,
+                        visible=False
+                    )
 
                     clone_btn = gr.Button("🎤 开始增量语音克隆", variant="primary")
-                    clone_status = gr.Textbox(label="克隆状态", lines=10)
+                    clone_status = gr.Textbox(label="克隆状态", lines=12)
+
+                # ✅ 时长统计面板
+                with gr.Group():
+                    gr.Markdown("### 📊 时长统计分析")
+
+                    with gr.Row():
+                        show_stats_btn = gr.Button("📊 显示时长统计", variant="secondary")
+                        refresh_table_btn = gr.Button("🔄 刷新表格", variant="secondary")
+
+                    duration_stats_display = gr.Markdown(
+                        "点击 '显示时长统计' 查看分析报告",
+                        elem_classes=["stats-box"]
+                    )
+
+                    with gr.Row():
+                        filter_over_limit = gr.Checkbox(
+                            label="🔍 只看超限片段（超过目标时长>0.1s）",
+                            value=False
+                        )
+                        filter_status = gr.Textbox(
+                            label="筛选状态",
+                            value="📋 显示全部片段",
+                            lines=1
+                        )
 
                 # 2B: 审核表格
                 with gr.Group():
@@ -846,7 +1218,7 @@ def build_ui_v2():
                     review_dataframe = gr.Dataframe(
                         headers=[
                             "索引", "时间", "原文", "翻译",
-                            "最大长度", "已生成长度", "音频", "问题", "状态"
+                            "目标长度", "实际长度", "时长状态", "音频", "审核"
                         ],
                         datatype=[
                             "number", "str", "str", "str",
@@ -867,7 +1239,7 @@ def build_ui_v2():
 
                 # 片段预览区
                 with gr.Group():
-                    gr.Markdown("### 👂 片段预览 (点击表格行预览)")
+                    gr.Markdown("### 👂 片段预览")
 
                     with gr.Row():
                         with gr.Column(scale=1):
@@ -878,7 +1250,7 @@ def build_ui_v2():
                             preview_status = gr.Textbox(label="状态", lines=1)
 
                         with gr.Column(scale=1):
-                            preview_info = gr.Textbox(label="片段信息", lines=3)
+                            preview_info = gr.Textbox(label="片段信息", lines=5)
                             preview_text = gr.Textbox(label="字幕文本", lines=4)
 
             # ========== 步骤3 ========== #
@@ -920,14 +1292,46 @@ def build_ui_v2():
             )
 
             # 步骤2A: 语音克隆
+            # 智能推荐 length_penalty
+            def on_suggest_penalty_click():
+                suggested, reason = suggest_length_penalty()
+                return suggested, reason, gr.update(visible=True)
+
+            suggest_penalty_btn.click(
+                on_suggest_penalty_click,
+                outputs=[length_penalty_slider, length_penalty_status, length_penalty_status]
+            )
+
+            # 步骤2A: 语音克隆
             clone_btn.click(
                 step2_incremental_voice_cloning,
                 inputs=[
                     reference_audio,
-                    ref_duration_slider,  # ✅ 新增
-                    ref_offset_slider  # ✅ 新增
+                    ref_duration_slider,
+                    ref_offset_slider,
+                    length_penalty_slider  # ✅ 传递 length_penalty
                 ],
-                outputs=[clone_status, review_dataframe]
+                outputs=[clone_status, review_dataframe, duration_stats_display]
+            )
+
+            # 显示统计
+            show_stats_btn.click(
+                show_duration_statistics,
+                outputs=[duration_stats_display, duration_stats_display]
+            )
+
+            # 筛选切换
+            filter_over_limit.change(
+                toggle_filter_over_limit,
+                inputs=[filter_over_limit],
+                outputs=[review_dataframe, filter_status]
+            )
+
+            # 刷新表格
+            refresh_table_btn.click(
+                refresh_review_table,
+                inputs=[filter_over_limit],
+                outputs=[review_dataframe, duration_stats_display]
             )
 
             # 步骤2B: 编辑保存
@@ -940,7 +1344,8 @@ def build_ui_v2():
             # 步骤2C: 重新生成
             regenerate_btn.click(
                 step2_regenerate_modified,
-                outputs=[edit_status, review_dataframe]
+                inputs=[length_penalty_slider],  # ✅ 传递当前 length_penalty
+                outputs=[edit_status, review_dataframe, duration_stats_display]
             )
 
             # 表格选择事件
